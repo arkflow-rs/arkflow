@@ -30,7 +30,11 @@ impl From<&NodePageQuery> for PageQuery {
     }
 }
 
-pub(super) async fn hub_system(State(hub): State<hub::Hub>, headers: HeaderMap) -> Response {
+pub(super) async fn hub_system(
+    State(hub): State<hub::Hub>,
+    ai: Option<axum::Extension<std::sync::Arc<hub::ai::AiCopilotService>>>,
+    headers: HeaderMap,
+) -> Response {
     // The auth middleware guarantees an authorized caller by the time the
     // handler runs; resolving again (rather than trusting an extension)
     // keeps the echo on the exact enforcement path. A None here still
@@ -45,11 +49,15 @@ pub(super) async fn hub_system(State(hub): State<hub::Hub>, headers: HeaderMap) 
     let fleet_visible = principal
         .as_ref()
         .is_some_and(|principal| principal.can_scope(OperatorAction::Read, "node", None));
+    let mut capabilities = vec!["node_registry", "command_dispatch", "fleet_aggregation"];
+    if ai.is_some_and(|ext| ext.0.config().enabled) {
+        capabilities.push("ai_copilot");
+    }
     let mut payload = serde_json::json!({
         "id": "arkflow-control-hub",
         "version": env!("CARGO_PKG_VERSION"),
         "state": "running",
-        "capabilities": ["node_registry", "command_dispatch", "fleet_aggregation"],
+        "capabilities": capabilities,
         "principal": principal.as_ref().map(|principal| principal.echo()),
     });
     if fleet_visible {

@@ -7,6 +7,19 @@ project follows [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+### Added — Engine & Durability
+
+- Object-store (`s3`) WAL segment retention and crash-safe reclamation
+  (`durability.backend.object_store.retention`: `enabled`, `max_segments`,
+  `max_age`, `max_bytes`). By default (`enabled: true` with no explicit caps),
+  sealed segments wholly behind the rewind-safe committed floor
+  (`min(manifest.cursor, reclaimable_hwm)` updated via `mark_committed`) are
+  reclaimed asynchronously on a decoupled, cancellable background loop using a
+  manifest-first `pending_deletes` protocol. `manifest.json` now persists
+  backward-compatible v2 per-segment metadata (`segment_meta`), allowing
+  startup recovery and replay reads to skip `GET` requests for covered segments
+  and `pending_deletes`.
+
 ### Added — Engine build
 
 - Connector families are gated behind cargo features on `arkflow-plugin`

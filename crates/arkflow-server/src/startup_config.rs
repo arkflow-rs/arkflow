@@ -242,6 +242,60 @@ pub fn apply_env_overrides(cfg: &mut HubStartupConfig, env: &dyn Fn(&str) -> Opt
     if let Some(value) = text("ARKFLOW_OTEL_SERVICE_NAME") {
         cfg.server.observability.tracing.service_name = value;
     }
+    apply_ai_overrides(&mut cfg.server.ai, env);
+}
+
+fn apply_ai_overrides(cfg: &mut crate::AiCopilotConfig, env: &dyn Fn(&str) -> Option<String>) {
+    let warn = |name: &str, value: &str, expected: &str| {
+        eprintln!("warning: {name}='{value}' is not {expected}; keeping the underlying value");
+    };
+    let text = |name: &str| env(name).filter(|value| !value.trim().is_empty());
+    if let Some(value) = env("ARKFLOW_AI_ENABLED") {
+        match value.as_str() {
+            "1" | "true" | "yes" => cfg.enabled = true,
+            "0" | "false" | "no" => cfg.enabled = false,
+            _ => warn("ARKFLOW_AI_ENABLED", &value, "one of 1/true/yes/0/false/no"),
+        }
+    }
+    if let Some(value) = text("ARKFLOW_AI_API_BASE") {
+        cfg.api_base = Some(value);
+    }
+    if let Some(value) = text("ARKFLOW_AI_MODEL") {
+        cfg.model = Some(value);
+    }
+    if let Some(value) = text("ARKFLOW_AI_API_KEY") {
+        cfg.api_key = Some(value);
+    }
+    if let Some(raw) = env("ARKFLOW_AI_TIMEOUT_MS") {
+        match raw.parse::<u64>() {
+            Ok(v) => cfg.timeout_ms = v,
+            Err(_) => warn("ARKFLOW_AI_TIMEOUT_MS", &raw, "a positive integer"),
+        }
+    }
+    if let Some(raw) = env("ARKFLOW_AI_MAX_TOOL_ROUNDS") {
+        match raw.parse::<usize>() {
+            Ok(v) => cfg.max_tool_rounds = v,
+            Err(_) => warn("ARKFLOW_AI_MAX_TOOL_ROUNDS", &raw, "a positive integer"),
+        }
+    }
+    if let Some(raw) = env("ARKFLOW_AI_MAX_TOKENS") {
+        match raw.parse::<u32>() {
+            Ok(v) => cfg.max_tokens = Some(v),
+            Err(_) => warn("ARKFLOW_AI_MAX_TOKENS", &raw, "a positive integer"),
+        }
+    }
+    if let Some(raw) = env("ARKFLOW_AI_REQUESTS_PER_MINUTE") {
+        match raw.parse::<u32>() {
+            Ok(v) => cfg.requests_per_minute = v,
+            Err(_) => warn("ARKFLOW_AI_REQUESTS_PER_MINUTE", &raw, "a positive integer"),
+        }
+    }
+    if let Some(raw) = env("ARKFLOW_AI_BURST") {
+        match raw.parse::<u32>() {
+            Ok(v) => cfg.burst = v,
+            Err(_) => warn("ARKFLOW_AI_BURST", &raw, "a positive integer"),
+        }
+    }
 }
 
 /// Rate-limit overrides; the warn-on-invalid spelling matches the previous
@@ -300,5 +354,52 @@ fn format_from_path(path: &str) -> Option<ConfigFormat> {
         Some(ConfigFormat::TOML)
     } else {
         None
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::collections::HashMap;
+
+    #[test]
+    fn startup_file_accepts_ai_section_and_env_overrides() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("hub.yaml");
+        std::fs::write(
+            &path,
+            r#"
+address: 127.0.0.1:8080
+ai:
+  enabled: true
+  api_base: https://api.openai.com/v1
+  model: gpt-4o-mini
+  timeout_ms: 45000
+  max_tool_rounds: 6
+"#,
+        )
+        .unwrap();
+
+        let mut loaded = load_startup_config(path.to_str().unwrap()).unwrap();
+        assert!(loaded.server.ai.enabled);
+        assert_eq!(
+            loaded.server.ai.api_base.as_deref(),
+            Some("https://api.openai.com/v1")
+        );
+        assert_eq!(loaded.server.ai.model.as_deref(), Some("gpt-4o-mini"));
+        assert_eq!(loaded.server.ai.timeout_ms, 45_000);
+        assert_eq!(loaded.server.ai.max_tool_rounds, 6);
+
+        let overrides: HashMap<&str, &str> = [
+            ("ARKFLOW_AI_MODEL", "qwen2.5:32b"),
+            ("ARKFLOW_AI_API_KEY", "sk-override"),
+            ("ARKFLOW_AI_MAX_TOOL_ROUNDS", "10"),
+        ]
+        .into_iter()
+        .collect();
+        apply_env_overrides(&mut loaded, &|k| overrides.get(k).map(|v| (*v).to_owned()));
+        assert_eq!(loaded.server.ai.model.as_deref(), Some("qwen2.5:32b"));
+        assert_eq!(loaded.server.ai.api_key.as_deref(), Some("sk-override"));
+        assert_eq!(loaded.server.ai.max_tool_rounds, 10);
     }
 }

@@ -1184,3 +1184,201 @@ progress {
   font-family: var(--mono-font, monospace);
   color: hsl(var(--muted-foreground));
 }
+
+/* AI Copilot drawer and proposal cards */
+.copilot-trigger {
+  border-color: var(--accent);
+  background: var(--accent-soft);
+  color: var(--text);
+  font-weight: 500;
+}
+
+aside.copilot-drawer {
+  position: fixed;
+  top: 0;
+  right: 0;
+  bottom: 0;
+  width: min(460px, 100vw);
+  background: var(--surface);
+  border-left: 1px solid var(--border);
+  border-right: 0;
+  padding: 16px;
+  display: flex;
+  flex-direction: column;
+  gap: 12px;
+  z-index: 40;
+  box-shadow: -8px 0 28px rgba(0, 0, 0, 0.3);
+}
+
+.copilot-header {
+  display: flex;
+  justify-content: space-between;
+  align-items: flex-start;
+  gap: 8px;
+  border-bottom: 1px solid var(--border);
+  padding-bottom: 10px;
+}
+
+.copilot-header small {
+  color: var(--muted);
+}
+
+.copilot-context {
+  display: flex;
+  justify-content: space-between;
+  align-items: center;
+  gap: 8px;
+  padding: 6px 10px;
+  border-radius: 7px;
+  background: var(--surface-2);
+  border: 1px solid var(--border);
+  font-size: 12px;
+}
+
+.copilot-messages {
+  flex: 1;
+  overflow-y: auto;
+  display: flex;
+  flex-direction: column;
+  gap: 10px;
+  padding-right: 2px;
+}
+
+.copilot-empty {
+  display: flex;
+  flex-direction: column;
+  gap: 12px;
+  color: var(--muted);
+  padding: 8px 0;
+}
+
+.copilot-starters {
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+}
+
+.copilot-starters button {
+  text-align: left;
+  background: var(--surface-2);
+}
+
+.copilot-msg {
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+  padding: 10px;
+  border-radius: 8px;
+  border: 1px solid var(--border);
+  background: var(--surface-2);
+}
+
+.copilot-msg-user {
+  background: var(--accent-soft);
+}
+
+.copilot-msg-role {
+  font-size: 11px;
+  font-weight: 600;
+  color: var(--muted);
+  text-transform: uppercase;
+}
+
+.copilot-msg-body {
+  margin: 0;
+  white-space: pre-wrap;
+  word-break: break-word;
+  font-family: var(--font-sans);
+  font-size: 13px;
+  line-height: 1.5;
+}
+
+.copilot-tools {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 4px;
+}
+
+.copilot-tool-chip {
+  font-size: 11px;
+  padding: 2px 7px;
+  border-radius: 999px;
+  border: 1px solid var(--border);
+  background: var(--surface);
+  color: var(--muted);
+}
+
+.copilot-tool-chip.done {
+  color: var(--ok);
+}
+
+.copilot-tool-chip.error {
+  color: var(--danger);
+}
+
+.copilot-proposal {
+  border: 1px solid var(--border-strong);
+  border-radius: 8px;
+  background: var(--surface);
+  padding: 10px;
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+}
+
+.copilot-proposal-head {
+  display: flex;
+  justify-content: space-between;
+  align-items: center;
+  gap: 8px;
+}
+
+.copilot-proposal-code {
+  margin: 0;
+  max-height: 180px;
+  overflow: auto;
+  padding: 8px;
+  border-radius: 6px;
+  background: var(--bg);
+  border: 1px solid var(--border);
+  font-family: var(--font-mono);
+  font-size: 12px;
+}
+
+.copilot-composer {
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+  border-top: 1px solid var(--border);
+  padding-top: 10px;
+}
+
+.copilot-composer textarea {
+  width: 100%;
+  resize: vertical;
+}
+
+.copilot-diff-bar {
+  margin-bottom: 10px;
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+}
+
+.copilot-diff-grid {
+  display: grid;
+  grid-template-columns: 1fr 1fr;
+  gap: 8px;
+}
+
+.copilot-diff-grid pre {
+  margin: 0;
+  max-height: 220px;
+  overflow: auto;
+  padding: 8px;
+  border-radius: 6px;
+  background: var(--bg);
+  border: 1px solid var(--border);
+  font-family: var(--font-mono);
+  font-size: 12px;
+}

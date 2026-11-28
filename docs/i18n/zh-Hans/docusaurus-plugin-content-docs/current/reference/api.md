@@ -448,6 +448,20 @@ subject 的联邦令牌若 `iat` 更早(60 秒时钟偏斜容差)会被拒绝。
 
 除就绪度、对账、outbox 与集群状态仪表之外,命令派发还暴露 `arkflow_command_duration_bucket{command,le}`(从入队到确认的延迟,附带 `_count`/`_sum`)与 `arkflow_command_total{command,outcome}`。标签来自固定词表——命令类型(`job_start`、`job_stop`、`job_checkpoint`、`job_savepoint`、流操作)与结果类别(`enqueued`、`acknowledged`、`succeeded`、`failed`、`cancelled`、`superseded`、`timed_out`、`node_unavailable`、`capacity`、`rejected`);未知命令名会折叠为 `other`,资源 ID、关联 ID 与错误文本绝不会成为标签。计数器在 Hub 重启时重置。
 
+### AI Copilot(`POST /api/v1/ai/chat`)
+
+当 Hub 启用 `ai.enabled`(参见 [CLI 参考](./cli.md))时,`GET /api/v1/system` 会在 `capabilities` 中通告 `"ai_copilot"`(绝不暴露 `api_key` 或 `api_base`),并挂载仅 Hub 可用的 SSE 编排端点:
+
+| 方法 | 路由 | 用途 |
+|--------|-------|---------|
+| `POST` | `/ai/chat` | 无状态多轮对话(`messages` 与可选 `context`),以 `text/event-stream` 流式返回 SSE 事件(`tool_start`、`tool_result`、`delta`、`proposal`、`done`、`error`)。 |
+
+行为与安全边界:
+
+- **只读与纯校验工具**:内置工具按调用者的 `OperatorPrincipal::can_scope` 严格裁剪权限,查询组件 Schema、节点、脱敏后的配置/作业、事件、指标与审计记录。配置与作业提案工具(`stream_config`、`job_spec`)要求 `Configure` 权限,且在发出 `proposal` 事件前必须在服务端通过 `parse_and_validate` / `deep_validate_job` 校验;审计查询要求 `ReadAudit`。没有任何工具可直接修改 Hub 状态。
+- **敏感信息脱敏与零数据面暴露**:明文凭据与 URL 密码会被掩码为 `******`,未展开的 `${secret:...}` / `${env:...}` 引用占位符可原样保留;永不读取或传输数据面 `MessageBatch` 负载。
+- **独立限流与元数据审计**:按主体实施令牌桶限流(`ai.requests_per_minute` / `ai.burst`,超限返回 `429 ai_rate_limit_exceeded` + `Retry-After`)。每次调用结束仅在 `cp_audit_events` 记录元数据(`ai.copilot.chat`,含模型、调用工具列表、token 用量与结果状态),绝不落库用户提问正文或模型回复。
+
 ## Hub Agent API(`/api/v1/agent/*`)
 
 Agent 契约与操作员契约相互独立:Agent 使用节点会话凭据(启用 Hub mTLS 时还须出示客户端证书)认证,拉取命令并推送观测。

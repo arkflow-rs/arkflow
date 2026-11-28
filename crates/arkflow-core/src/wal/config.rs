@@ -68,7 +68,7 @@ pub struct SegmentTuningConfig {
     /// Override max_bytes from the preset strategy.
     pub max_bytes: Option<usize>,
     /// Override flush_interval from the preset strategy.
-    #[serde(with = "duration_serde_option", default)]
+    #[serde(with = "lenient_duration_serde_option", default)]
     pub flush_interval: Option<Duration>,
 }
 
@@ -159,6 +159,54 @@ impl CompressionConfig {
     /// Minimum segment size to apply compression (in bytes). Segments smaller than this
     /// are uploaded uncompressed to avoid CPU overhead.
     pub const MIN_COMPRESSION_SIZE: usize = 10 * 1024; // 10 KB
+}
+
+fn default_retention_enabled() -> bool {
+    true
+}
+
+/// Retention policy for sealed segments on the object-store WAL backend.
+///
+/// Only sealed segments in `sealed_segments` wholly at or below the committed
+/// reclaim floor (`last_seq <= reclaim_floor`) are ever eligible for deletion;
+/// unacknowledged segments and `active_segment` are never deleted.
+///
+/// When `enabled` is `true` (the default) and all three caps (`max_segments`,
+/// `max_age`, `max_bytes`) are `None`, every eligible sealed segment is
+/// reclaimed immediately. When one or more caps are set, only the contiguous
+/// newest suffix of eligible segments satisfying all configured caps is kept.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct RetentionConfig {
+    /// Enable automatic reclamation of acknowledged sealed segments.
+    /// Defaults to `true`.
+    #[serde(default = "default_retention_enabled")]
+    pub enabled: bool,
+    /// Maximum number of acknowledged (reclaim-eligible) sealed segments to
+    /// retain behind the committed reclaim floor. `Some(0)` reclaims all
+    /// eligible segments immediately; `None` imposes no count cap unless all
+    /// three caps are `None` (default immediate reclaim).
+    #[serde(default)]
+    pub max_segments: Option<usize>,
+    /// Maximum age of acknowledged sealed segments (measured from segment
+    /// seal time). Eligible segments older than `max_age` are reclaimed.
+    #[serde(with = "duration_serde_option", default)]
+    pub max_age: Option<Duration>,
+    /// Maximum total compressed bytes across retained acknowledged sealed
+    /// segments. When exceeded, the violating segment and all older eligible
+    /// segments are reclaimed.
+    #[serde(default)]
+    pub max_bytes: Option<u64>,
+}
+
+impl Default for RetentionConfig {
+    fn default() -> Self {
+        Self {
+            enabled: default_retention_enabled(),
+            max_segments: None,
+            max_age: None,
+            max_bytes: None,
+        }
+    }
 }
 
 /// Backend selection for the WAL.
@@ -252,6 +300,10 @@ pub struct ObjectStoreWalConfig {
     /// Compression configuration.
     #[serde(default)]
     pub compression: CompressionConfig,
+    /// Sealed-segment retention policy. Defaults to `enabled: true` with
+    /// immediate reclamation of eligible acknowledged sealed segments.
+    #[serde(default)]
+    pub retention: RetentionConfig,
     /// Sync policy. Forced to `GroupCommit`/`Periodic` at the store level;
     /// `PerEntry` is rejected at config-load time.
     #[serde(default)]
@@ -346,14 +398,186 @@ impl Default for CursorFlushConfig {
     }
 }
 
-// --- duration serde (humantime-ish string form: "1s", "500ms") ---
+// --- duration serde (humantime string form: "1s", "500ms", "24h", "7d", "1h30m") ---
+
+fn parse_checked_compound_duration(trimmed: &str) -> Result<Duration, String> {
+    let mut total = Duration::ZERO;
+    let mut rest = if let Some(after_plus) = trimmed.strip_prefix('+') {
+        if after_plus.starts_with(|c: char| c.is_ascii_digit()) {
+            after_plus
+        } else {
+            return Err(format!("invalid duration: {trimmed}"));
+        }
+    } else {
+        trimmed
+    };
+    let mut parsed_any = false;
+
+    while !rest.is_empty() {
+        rest = rest.trim_start();
+        if rest.is_empty() {
+            break;
+        }
+        let digit_end = rest
+            .find(|c: char| !c.is_ascii_digit())
+            .unwrap_or(rest.len());
+        if digit_end == 0 {
+            return Err(format!("invalid duration: {trimmed}"));
+        }
+        let value: u128 = rest[..digit_end]
+            .parse()
+            .map_err(|_| format!("invalid duration: {trimmed}"))?;
+        rest = rest[digit_end..].trim_start();
+        let unit_end = rest
+            .find(|c: char| c.is_ascii_digit() || c.is_whitespace())
+            .unwrap_or(rest.len());
+        if unit_end == 0 {
+            return Err(format!("invalid duration: {trimmed}"));
+        }
+        let unit = &rest[..unit_end];
+        rest = &rest[unit_end..];
+
+        let term = match unit {
+            "ns" | "nsec" | "nsecs" | "nanosecond" | "nanoseconds" => {
+                let secs = u64::try_from(value / 1_000_000_000)
+                    .map_err(|_| format!("invalid duration: {trimmed}"))?;
+                let nanos = (value % 1_000_000_000) as u32;
+                Duration::new(secs, nanos)
+            }
+            "us" | "usec" | "usecs" | "µs" | "μs" | "microsecond" | "microseconds" => {
+                let total_ns = value
+                    .checked_mul(1_000)
+                    .ok_or_else(|| format!("invalid duration: {trimmed}"))?;
+                let secs = u64::try_from(total_ns / 1_000_000_000)
+                    .map_err(|_| format!("invalid duration: {trimmed}"))?;
+                let nanos = (total_ns % 1_000_000_000) as u32;
+                Duration::new(secs, nanos)
+            }
+            "ms" | "msec" | "msecs" | "millisecond" | "milliseconds" => {
+                let secs = u64::try_from(value / 1_000)
+                    .map_err(|_| format!("invalid duration: {trimmed}"))?;
+                let nanos = ((value % 1_000) * 1_000_000) as u32;
+                Duration::new(secs, nanos)
+            }
+            "s" | "sec" | "secs" | "second" | "seconds" => {
+                let secs =
+                    u64::try_from(value).map_err(|_| format!("invalid duration: {trimmed}"))?;
+                Duration::from_secs(secs)
+            }
+            "m" | "min" | "mins" | "minute" | "minutes" => {
+                let secs_u128 = value
+                    .checked_mul(60)
+                    .ok_or_else(|| format!("invalid duration: {trimmed}"))?;
+                let secs =
+                    u64::try_from(secs_u128).map_err(|_| format!("invalid duration: {trimmed}"))?;
+                Duration::from_secs(secs)
+            }
+            "h" | "hr" | "hrs" | "hour" | "hours" => {
+                let secs_u128 = value
+                    .checked_mul(3_600)
+                    .ok_or_else(|| format!("invalid duration: {trimmed}"))?;
+                let secs =
+                    u64::try_from(secs_u128).map_err(|_| format!("invalid duration: {trimmed}"))?;
+                Duration::from_secs(secs)
+            }
+            "d" | "day" | "days" => {
+                let secs_u128 = value
+                    .checked_mul(86_400)
+                    .ok_or_else(|| format!("invalid duration: {trimmed}"))?;
+                let secs =
+                    u64::try_from(secs_u128).map_err(|_| format!("invalid duration: {trimmed}"))?;
+                Duration::from_secs(secs)
+            }
+            "w" | "week" | "weeks" => {
+                let secs_u128 = value
+                    .checked_mul(604_800)
+                    .ok_or_else(|| format!("invalid duration: {trimmed}"))?;
+                let secs =
+                    u64::try_from(secs_u128).map_err(|_| format!("invalid duration: {trimmed}"))?;
+                Duration::from_secs(secs)
+            }
+            "M" | "month" | "months" => {
+                let secs_u128 = value
+                    .checked_mul(2_630_016)
+                    .ok_or_else(|| format!("invalid duration: {trimmed}"))?;
+                let secs =
+                    u64::try_from(secs_u128).map_err(|_| format!("invalid duration: {trimmed}"))?;
+                Duration::from_secs(secs)
+            }
+            "y" | "year" | "years" => {
+                let secs_u128 = value
+                    .checked_mul(31_557_600)
+                    .ok_or_else(|| format!("invalid duration: {trimmed}"))?;
+                let secs =
+                    u64::try_from(secs_u128).map_err(|_| format!("invalid duration: {trimmed}"))?;
+                Duration::from_secs(secs)
+            }
+            _ => return Err(format!("invalid duration: {trimmed}")),
+        };
+
+        total = total
+            .checked_add(term)
+            .ok_or_else(|| format!("invalid duration: {trimmed}"))?;
+        parsed_any = true;
+    }
+
+    if parsed_any {
+        Ok(total)
+    } else {
+        Err(format!("invalid duration: {trimmed}"))
+    }
+}
+
+fn parse_duration_human(s: &str) -> Result<Duration, String> {
+    let trimmed = s.trim();
+    if trimmed.is_empty() {
+        return Err("duration string must not be empty".to_string());
+    }
+    // Single integer millisecond term (preserves leading '+' like "+500ms"
+    // and round-trips large u64/u128 millisecond values without ns overflow).
+    if let Some(rest) = trimmed.strip_suffix("ms") {
+        if let Ok(ms) = rest.parse::<u128>() {
+            let secs = u64::try_from(ms / 1_000).map_err(|_| format!("invalid duration: {s}"))?;
+            let nanos = ((ms % 1_000) * 1_000_000) as u32;
+            return Ok(Duration::new(secs, nanos));
+        }
+    }
+    if let Ok(d) = parse_checked_compound_duration(trimmed) {
+        return Ok(d);
+    }
+    // Preserve backward compatibility with fractional seconds ("0.5s") and
+    // bare millisecond strings ("500"). Use `try_from_secs_f64` so values
+    // exceeding `Duration::MAX` (e.g. `"1e20s"`) return an error instead of
+    // panicking.
+    if let Some(rest) = trimmed.strip_suffix('s') {
+        if let Ok(secs) = rest.parse::<f64>() {
+            return Duration::try_from_secs_f64(secs).map_err(|_| format!("invalid duration: {s}"));
+        }
+    }
+    if let Ok(ms) = trimmed.parse::<u64>() {
+        return Ok(Duration::from_millis(ms));
+    }
+    Err(format!("invalid duration: {s}"))
+}
+
+/// Format a `Duration` preserving exact millisecond output (`"500ms"`) while
+/// serializing sub-millisecond durations losslessly via `humantime` (e.g.
+/// `500µs` → `"500us"` instead of truncating to `"0ms"`).
+fn format_duration_lossless(d: &Duration) -> String {
+    if d.subsec_nanos().is_multiple_of(1_000_000) {
+        format!("{}ms", d.as_millis())
+    } else {
+        humantime::format_duration(*d).to_string()
+    }
+}
 
 pub mod duration_serde {
+    use super::{format_duration_lossless, parse_duration_human};
     use serde::{Deserialize, Deserializer, Serializer};
     use std::time::Duration;
 
     pub fn serialize<S: Serializer>(d: &Duration, s: S) -> Result<S::Ok, S::Error> {
-        s.serialize_str(&format!("{}ms", d.as_millis()))
+        s.serialize_str(&format_duration_lossless(d))
     }
 
     pub fn deserialize<'de, D: Deserializer<'de>>(d: D) -> Result<Duration, D::Error> {
@@ -365,38 +589,20 @@ pub mod duration_serde {
         }
         match Raw::deserialize(d)? {
             Raw::Int(ms) => Ok(Duration::from_millis(ms)),
-            Raw::Str(s) => parse_human(&s)
-                .ok_or_else(|| serde::de::Error::custom(format!("invalid duration: {}", s))),
+            Raw::Str(s) => parse_duration_human(&s).map_err(serde::de::Error::custom),
         }
-    }
-
-    fn parse_human(s: &str) -> Option<Duration> {
-        let s = s.trim();
-        if let Some(rest) = s.strip_suffix("ms") {
-            return rest.parse::<u64>().ok().map(Duration::from_millis);
-        }
-        if let Some(rest) = s.strip_suffix('s') {
-            if let Ok(secs) = rest.parse::<f64>() {
-                return Some(Duration::from_secs_f64(secs));
-            }
-        }
-        if let Some(rest) = s.strip_suffix('m') {
-            if let Ok(mins) = rest.parse::<u64>() {
-                return Some(Duration::from_secs(mins * 60));
-            }
-        }
-        s.parse::<u64>().ok().map(Duration::from_millis)
     }
 }
 
-/// Duration serde for Option<Duration> fields.
+/// Duration serde for Option<Duration> fields (strict on malformed non-empty strings).
 pub mod duration_serde_option {
+    use super::{format_duration_lossless, parse_duration_human};
     use serde::{Deserialize, Deserializer, Serializer};
     use std::time::Duration;
 
     pub fn serialize<S: Serializer>(d: &Option<Duration>, s: S) -> Result<S::Ok, S::Error> {
         match d {
-            Some(duration) => s.serialize_str(&format!("{}ms", duration.as_millis())),
+            Some(duration) => s.serialize_str(&format_duration_lossless(duration)),
             None => s.serialize_none(),
         }
     }
@@ -404,34 +610,89 @@ pub mod duration_serde_option {
     pub fn deserialize<'de, D: Deserializer<'de>>(d: D) -> Result<Option<Duration>, D::Error> {
         #[derive(Deserialize)]
         #[serde(untagged)]
-        enum RawOption {
+        enum Raw {
             Str(String),
             Int(u64),
-            None,
         }
-        match RawOption::deserialize(d)? {
-            RawOption::Str(s) => Ok(parse_human(&s)),
-            RawOption::Int(ms) => Ok(Some(Duration::from_millis(ms))),
-            RawOption::None => Ok(None),
+        match Option::<Raw>::deserialize(d)? {
+            None => Ok(None),
+            Some(Raw::Int(ms)) => Ok(Some(Duration::from_millis(ms))),
+            Some(Raw::Str(s)) => {
+                if s.trim().is_empty() {
+                    Ok(None)
+                } else {
+                    parse_duration_human(&s)
+                        .map(Some)
+                        .map_err(serde::de::Error::custom)
+                }
+            }
+        }
+    }
+}
+
+/// Backward-compatible optional duration serde for `segment_tuning.flush_interval`:
+/// preserves the legacy grammar (`ms`, checked `s`, checked `m`, bare integer
+/// `ms`, plus leading `+`) and treats blank or unrecognized strings (e.g.
+/// `"auto"`, `"1h"`) as `None` so the `strategy` preset still applies.
+pub mod lenient_duration_serde_option {
+    use super::format_duration_lossless;
+    use serde::{Deserialize, Deserializer, Serializer};
+    use std::time::Duration;
+
+    pub fn serialize<S: Serializer>(d: &Option<Duration>, s: S) -> Result<S::Ok, S::Error> {
+        match d {
+            Some(duration) => s.serialize_str(&format_duration_lossless(duration)),
+            None => s.serialize_none(),
         }
     }
 
-    fn parse_human(s: &str) -> Option<Duration> {
-        let s = s.trim();
-        if let Some(rest) = s.strip_suffix("ms") {
-            return rest.parse::<u64>().ok().map(Duration::from_millis);
+    fn parse_legacy_tuning_duration(s: &str) -> Option<Duration> {
+        let trimmed = s.trim();
+        if trimmed.is_empty() {
+            return None;
         }
-        if let Some(rest) = s.strip_suffix('s') {
+        if let Some(rest) = trimmed.strip_suffix("ms") {
+            let digits = rest.strip_prefix('+').unwrap_or(rest);
+            if digits.bytes().all(|b| b.is_ascii_digit()) && !digits.is_empty() {
+                if let Ok(ms) = digits.parse::<u128>() {
+                    if let Ok(secs) = u64::try_from(ms / 1_000) {
+                        let nanos = ((ms % 1_000) * 1_000_000) as u32;
+                        return Some(Duration::new(secs, nanos));
+                    }
+                }
+            }
+            return None;
+        }
+        if let Some(rest) = trimmed.strip_suffix('s') {
             if let Ok(secs) = rest.parse::<f64>() {
-                return Some(Duration::from_secs_f64(secs));
+                return Duration::try_from_secs_f64(secs).ok();
             }
+            return None;
         }
-        if let Some(rest) = s.strip_suffix('m') {
-            if let Ok(mins) = rest.parse::<u64>() {
-                return Some(Duration::from_secs(mins * 60));
+        if let Some(rest) = trimmed.strip_suffix('m') {
+            let digits = rest.strip_prefix('+').unwrap_or(rest);
+            if digits.bytes().all(|b| b.is_ascii_digit()) && !digits.is_empty() {
+                if let Ok(mins) = digits.parse::<u64>() {
+                    return mins.checked_mul(60).map(Duration::from_secs);
+                }
             }
+            return None;
         }
-        s.parse::<u64>().ok().map(Duration::from_millis)
+        trimmed.parse::<u64>().ok().map(Duration::from_millis)
+    }
+
+    pub fn deserialize<'de, D: Deserializer<'de>>(d: D) -> Result<Option<Duration>, D::Error> {
+        #[derive(Deserialize)]
+        #[serde(untagged)]
+        enum Raw {
+            Str(String),
+            Int(u64),
+        }
+        match Option::<Raw>::deserialize(d)? {
+            None => Ok(None),
+            Some(Raw::Int(ms)) => Ok(Some(Duration::from_millis(ms))),
+            Some(Raw::Str(s)) => Ok(parse_legacy_tuning_duration(&s)),
+        }
     }
 }
 
@@ -546,6 +807,7 @@ mod tests {
             segment_tuning: SegmentTuningConfig::default(),
             parallel_put: ParallelPutConfig::default(),
             compression: CompressionConfig::default(),
+            retention: RetentionConfig::default(),
             sync: SyncPolicy::GroupCommit,
         };
         let cfg = WalConfig {
@@ -753,5 +1015,370 @@ mod tests {
         ));
         assert_eq!(o.parallel_put.workers, 1);
         assert!(matches!(o.compression, CompressionConfig::None));
+        assert_eq!(o.retention, RetentionConfig::default());
+        assert!(o.retention.enabled);
+        assert_eq!(o.retention.max_segments, None);
+        assert_eq!(o.retention.max_age, None);
+        assert_eq!(o.retention.max_bytes, None);
+    }
+
+    #[test]
+    fn object_store_with_retention_fields_parses() {
+        let yaml = r#"
+            type: object_store
+            node_id: pod-a
+            stream_id: main
+            retention:
+              enabled: true
+              max_segments: 16
+              max_age: "24h"
+              max_bytes: 10485760
+            s3:
+              bucket: b
+        "#;
+        let b: WalBackend = serde_yaml::from_str(yaml).unwrap();
+        let o = match b {
+            WalBackend::ObjectStore(o) => o,
+            _ => panic!(),
+        };
+        assert!(o.retention.enabled);
+        assert_eq!(o.retention.max_segments, Some(16));
+        assert_eq!(o.retention.max_age, Some(Duration::from_secs(24 * 3600)));
+        assert_eq!(o.retention.max_bytes, Some(10 * 1024 * 1024));
+    }
+
+    #[test]
+    fn retention_supports_days_compound_durations_and_disabled() {
+        let yaml = r#"
+            type: object_store
+            node_id: pod-a
+            stream_id: main
+            retention:
+              enabled: false
+              max_age: "7d"
+            s3:
+              bucket: b
+        "#;
+        let b: WalBackend = serde_yaml::from_str(yaml).unwrap();
+        let o = match b {
+            WalBackend::ObjectStore(o) => o,
+            _ => panic!(),
+        };
+        assert!(!o.retention.enabled);
+        assert_eq!(o.retention.max_age, Some(Duration::from_secs(7 * 86400)));
+
+        let yaml_compound = r#"
+            type: object_store
+            node_id: pod-a
+            stream_id: main
+            retention:
+              max_age: "1h30m"
+            s3:
+              bucket: b
+        "#;
+        let b2: WalBackend = serde_yaml::from_str(yaml_compound).unwrap();
+        let o2 = match b2 {
+            WalBackend::ObjectStore(o) => o,
+            _ => panic!(),
+        };
+        assert_eq!(o2.retention.max_age, Some(Duration::from_secs(5400)));
+    }
+
+    #[test]
+    fn retention_rejects_invalid_duration_and_zero_max_age() {
+        let bad_duration_yaml = r#"
+            type: object_store
+            node_id: pod-a
+            stream_id: main
+            retention:
+              max_age: "not-a-duration"
+            s3:
+              bucket: b
+        "#;
+        assert!(serde_yaml::from_str::<WalBackend>(bad_duration_yaml).is_err());
+
+        let zero_age_yaml = r#"
+            type: object_store
+            node_id: pod-a
+            stream_id: main
+            retention:
+              max_age: "0s"
+            s3:
+              bucket: b
+        "#;
+        let b: WalBackend = serde_yaml::from_str(zero_age_yaml).unwrap();
+        let cfg = WalConfig {
+            enabled: true,
+            path: String::new(),
+            sync: SyncPolicy::default(),
+            backend: Some(b),
+        };
+        let err = cfg.validate().unwrap_err();
+        assert!(
+            err.to_string().contains("max_age"),
+            "expected max_age error, got: {err}"
+        );
+    }
+
+    #[test]
+    fn retention_submillisecond_max_age_round_trips_and_validates() {
+        let mut o = ObjectStoreWalConfig {
+            node_id: "pod-a".into(),
+            stream_id: "main".into(),
+            prefix: default_prefix(),
+            s3: ObjectStoreS3Config {
+                bucket: "b".into(),
+                region: None,
+                endpoint: None,
+                access_key_id: None,
+                secret_access_key: None,
+                allow_http: false,
+            },
+            segment: SegmentConfig::default(),
+            cursor: CursorFlushConfig::default(),
+            segment_tuning: SegmentTuningConfig::default(),
+            parallel_put: ParallelPutConfig::default(),
+            compression: CompressionConfig::default(),
+            retention: RetentionConfig {
+                enabled: true,
+                max_segments: None,
+                max_age: Some(Duration::from_micros(500)),
+                max_bytes: None,
+            },
+            sync: SyncPolicy::GroupCommit,
+        };
+        let yaml = serde_yaml::to_string(&WalBackend::ObjectStore(o.clone())).unwrap();
+        assert!(
+            yaml.contains("max_age: 500us"),
+            "sub-millisecond max_age must serialize losslessly as 500us: {yaml}"
+        );
+        let reloaded: WalBackend = serde_yaml::from_str(&yaml).unwrap();
+        let cfg = WalConfig {
+            enabled: true,
+            path: String::new(),
+            sync: SyncPolicy::default(),
+            backend: Some(reloaded.clone()),
+        };
+        cfg.validate()
+            .expect("reloaded sub-millisecond max_age must validate");
+        match reloaded {
+            WalBackend::ObjectStore(r) => {
+                assert_eq!(r.retention.max_age, Some(Duration::from_micros(500)));
+            }
+            _ => panic!("expected ObjectStore"),
+        }
+
+        // Exact millisecond values still serialize with ms suffix.
+        o.retention.max_age = Some(Duration::from_millis(250));
+        let ms_yaml = serde_yaml::to_string(&WalBackend::ObjectStore(o)).unwrap();
+        assert!(ms_yaml.contains("max_age: 250ms"), "got: {ms_yaml}");
+    }
+
+    #[test]
+    fn retention_rejects_overflowing_fractional_seconds_and_keeps_valid_fractions() {
+        let overflow_yaml = r#"
+            type: object_store
+            node_id: pod-a
+            stream_id: main
+            retention:
+              max_age: "1e20s"
+            s3:
+              bucket: b
+        "#;
+        assert!(
+            serde_yaml::from_str::<WalBackend>(overflow_yaml).is_err(),
+            "overflowing fractional seconds must fail deserialization instead of panicking"
+        );
+
+        let valid_yaml = r#"
+            type: object_store
+            node_id: pod-a
+            stream_id: main
+            retention:
+              max_age: "0.5s"
+            s3:
+              bucket: b
+        "#;
+        let b: WalBackend = serde_yaml::from_str(valid_yaml).unwrap();
+        match b {
+            WalBackend::ObjectStore(o) => {
+                assert_eq!(o.retention.max_age, Some(Duration::from_millis(500)));
+            }
+            _ => panic!("expected ObjectStore"),
+        }
+
+        // Compound carry overflow must return a deserialization error (no panic).
+        let compound_overflow_yaml = r#"
+            type: object_store
+            node_id: pod-a
+            stream_id: main
+            segment:
+              flush_interval: "18446744073709551615s 1000ms"
+            s3:
+              bucket: b
+        "#;
+        assert!(
+            serde_yaml::from_str::<WalBackend>(compound_overflow_yaml).is_err(),
+            "compound carry overflow must be rejected without panicking"
+        );
+
+        // Single integer ms term preserves leading '+' and large u64 ms round-trip.
+        let plus_and_large_ms_yaml = r#"
+            type: object_store
+            node_id: pod-a
+            stream_id: main
+            segment:
+              flush_interval: "+500ms"
+            retention:
+              max_age: 18446744073710
+            s3:
+              bucket: b
+        "#;
+        let b_ms: WalBackend = serde_yaml::from_str(plus_and_large_ms_yaml).unwrap();
+        let serialized = serde_yaml::to_string(&b_ms).unwrap();
+        let reloaded: WalBackend = serde_yaml::from_str(&serialized).unwrap();
+        match reloaded {
+            WalBackend::ObjectStore(o) => {
+                assert_eq!(o.segment.flush_interval, Duration::from_millis(500));
+                assert_eq!(
+                    o.retention.max_age,
+                    Some(Duration::from_millis(18_446_744_073_710))
+                );
+            }
+            _ => panic!("expected ObjectStore"),
+        }
+
+        // Leading '+' on non-ms compound terms (e.g. "+2m") and blank optional
+        // durations (e.g. segment_tuning.flush_interval: "") remain supported.
+        let plus_min_and_blank_opt_yaml = r#"
+            type: object_store
+            node_id: pod-a
+            stream_id: main
+            segment:
+              flush_interval: "+2m"
+            segment_tuning:
+              strategy: low_latency
+              flush_interval: ""
+            retention:
+              max_age: ""
+            s3:
+              bucket: b
+        "#;
+        let b_plus: WalBackend = serde_yaml::from_str(plus_min_and_blank_opt_yaml).unwrap();
+        match b_plus {
+            WalBackend::ObjectStore(o) => {
+                assert_eq!(o.segment.flush_interval, Duration::from_secs(120));
+                assert_eq!(o.segment_tuning.flush_interval, None);
+                assert_eq!(
+                    o.segment_tuning.resolve().flush_interval,
+                    Duration::from_millis(100)
+                );
+                assert_eq!(o.retention.max_age, None);
+            }
+            _ => panic!("expected ObjectStore"),
+        }
+
+        // Blank required duration still fails.
+        let blank_required_yaml = r#"
+            type: object_store
+            node_id: pod-a
+            stream_id: main
+            segment:
+              flush_interval: ""
+            s3:
+              bucket: b
+        "#;
+        assert!(serde_yaml::from_str::<WalBackend>(blank_required_yaml).is_err());
+
+        // Legacy `segment_tuning.flush_interval` preserves `None` fallback for
+        // non-legacy strings (e.g. `"auto"` and `"1h"` -> strategy preset 100ms),
+        // while still accepting legacy overrides (`"500ms"`, `"+2m"`, `"0.5s"`)
+        // and keeping `retention.max_age` strict.
+        let legacy_auto_yaml = r#"
+            type: object_store
+            node_id: pod-a
+            stream_id: main
+            segment_tuning:
+              strategy: low_latency
+              flush_interval: "1h"
+            s3:
+              bucket: b
+        "#;
+        match serde_yaml::from_str::<WalBackend>(legacy_auto_yaml).unwrap() {
+            WalBackend::ObjectStore(o) => {
+                assert_eq!(o.segment_tuning.flush_interval, None);
+                assert_eq!(
+                    o.segment_tuning.resolve().flush_interval,
+                    Duration::from_millis(100)
+                );
+            }
+            _ => panic!("expected ObjectStore"),
+        }
+        let legacy_auto_str_yaml = r#"
+            type: object_store
+            node_id: pod-a
+            stream_id: main
+            segment_tuning:
+              strategy: low_latency
+              flush_interval: "auto"
+            s3:
+              bucket: b
+        "#;
+        assert_eq!(
+            match serde_yaml::from_str::<WalBackend>(legacy_auto_str_yaml).unwrap() {
+                WalBackend::ObjectStore(o) => o.segment_tuning.resolve().flush_interval,
+                _ => panic!("expected ObjectStore"),
+            },
+            Duration::from_millis(100)
+        );
+        let legacy_override_yaml = r#"
+            type: object_store
+            node_id: pod-a
+            stream_id: main
+            segment_tuning:
+              strategy: low_latency
+              flush_interval: "+2m"
+            s3:
+              bucket: b
+        "#;
+        assert_eq!(
+            match serde_yaml::from_str::<WalBackend>(legacy_override_yaml).unwrap() {
+                WalBackend::ObjectStore(o) => o.segment_tuning.resolve().flush_interval,
+                _ => panic!("expected ObjectStore"),
+            },
+            Duration::from_secs(120)
+        );
+        let strict_max_age_auto_yaml = r#"
+            type: object_store
+            node_id: pod-a
+            stream_id: main
+            retention:
+              max_age: "auto"
+            s3:
+              bucket: b
+        "#;
+        assert!(serde_yaml::from_str::<WalBackend>(strict_max_age_auto_yaml).is_err());
+
+        // Huge `segment.flush_interval` that would overflow `4 * interval + 5s`
+        // must be rejected cleanly by `WalConfig::validate`.
+        let huge_flush_yaml = r#"
+            type: object_store
+            node_id: pod-a
+            stream_id: main
+            segment:
+              flush_interval: "10000000000000000000sec"
+            s3:
+              bucket: b
+        "#;
+        let parsed_huge = WalConfig {
+            enabled: true,
+            sync: SyncPolicy::GroupCommit,
+            backend: Some(serde_yaml::from_str::<WalBackend>(huge_flush_yaml).unwrap()),
+            ..WalConfig::default()
+        };
+        assert!(
+            parsed_huge.validate().is_err(),
+            "flush_interval overflowing 4*interval+5s deadline must fail validation"
+        );
     }
 }

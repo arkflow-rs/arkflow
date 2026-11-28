@@ -180,6 +180,49 @@ durability:
 
 **CPU 成本与节省:**压缩用 CPU 换取网络与存储。在现代 CPU 上,zstd-3 约占 5-10% 的单核利用率,换来约 70% 的存储缩减。CPU 受限的负载用 `lz4`,存储受限的负载用 `zstd-9`。
 
+## 维度 4:段保留策略与自动回收
+
+如果没有回收机制,S3 WAL 的已密封段和 `manifest.json` 会无界增长,重启时需要下载并过滤全部历史段。`retention` 块用于控制已确认密封段的自动回收。
+
+```yaml validate=fragment wrap=durability
+durability:
+  backend:
+    type: object_store
+    node_id: "${ARKFLOW_NODE_ID}"
+    stream_id: main
+    s3:
+      bucket: my-bucket
+    retention:
+      enabled: true        # default: true
+      max_segments: 16     # optional: max acknowledged sealed segments to keep
+      max_age: "24h"       # optional: max age (supports ms, s, m, h, d, e.g. "1h30m")
+      max_bytes: 67108864  # optional: max total bytes across kept acknowledged segments
+```
+
+### 默认策略与多上限语义
+
+- **默认策略(省略 `retention`,或 `enabled: true` 且三项上限均未设置):**后台回收循环会立即回收**所有**满足安全下界的已确认密封段(与本地 `redb` WAL 回收语义一致)。
+- **显式上限(`max_segments`、`max_age`、`max_bytes`):**只要显式配置了其中一项或多项,仅按已配置的上限生效。系统从新到旧扫描可回收段,遇到首个超限段即停止保留并回收该段及所有更老的段,始终保留连续的最新后缀,不产生历史空洞。
+- **关闭回收(`enabled: false`):**仅停止 ArkFlow 自身的段删除(保留已密封段)。注意 S3 Bucket Lifecycle 过期规则**不感知 WAL 游标**,**切勿**在活跃 WAL 前缀上配置当前版本对象过期规则(一旦下游停滞超过过期时间,可能删除尚未确认的段);按时间过期的 lifecycle 规则只应用于独立归档副本,或用于版本化桶的非当前版本清理。
+
+### 安全性与崩溃恢复保障
+
+- **Rewind 安全下界:**仅 `sealed_segments` 中满足 `last_seq <= min(manifest.cursor, reclaimable_hwm)` 的段可被回收。`reclaimable_hwm` 仅在源确认提交成功后(`mark_committed(seq)`)推进到 `seq - 1`,与本地 `redb` 保持一致,确保在途 `rewind_cursor` 或 `Wal::undo(seq)` 绝不会读到已删除段。未确认段与最新的 `active_segment` 永远不会被删除。
+- **Manifest 优先的崩溃安全顺序:**回收运行在独立、可取消的后台循环中(与段密封循环解耦,慢速或失败的 S3 删除不会阻塞摄入、不会拉长确认门控延迟,也不会卡住 `close()`):
+  1. 通过 ETag 条件写入更新 `manifest.json`,将待回收段从 `sealed_segments` 移入 `pending_deletes`。
+  2. 按批(每轮上限 64 个对象)尽力执行 S3 `DELETE`(`NotFound` 视为幂等成功)。
+  3. 通过 ETag 条件写入将已确认删除的段名从 `pending_deletes` 中清理。
+- **只读必要段的快速恢复:**`manifest.json` 持久化每段的序列范围、字节大小与密封时间(`segment_meta`,保持向后兼容的 schema v2)。重启时,`recover()`、`read_after_cursor()` 与 `read_after()` 会跳过 `pending_deletes` 以及所有 `last_seq <= manifest.cursor` 的段,不发 `GET` 请求,仅下载未确认段(或尚无元数据的历史/LIST-fallback 段)。
+
+### 对象存储成本模型
+
+| 成本项 | 启用保留策略后的行为 |
+| --- | --- |
+| **对象存储占用** | 保留上限(`max_segments`、`max_age`、`max_bytes`)仅决定**保留哪些当前(current)已确认历史段**,不等同于桶内总存储占用。实际当前对象占用等于以下类别下**不重复当前对象**的总大小:未确认段、`active_segment`(1 个已密封段)、仍受撤销(undo)保护的段(包含最新已提交序列)、策略保留的历史段以及 `pending_deletes` 队列(同一对象同时属于多个类别时——例如 `active_segment` 本身尚未确认——只计算一次;每轮最多删除 64 个对象,排队或删除失败的段在后续重试成功前仍占用存储空间)。若 S3 桶开启了**对象版本控制**,按 key 删除只会生成 delete marker,非当前版本仍会计费,需配合 noncurrent-version 过期规则回收这部分空间。 |
+| **DELETE 请求** | AWS S3 及主流兼容对象存储对标准 `DELETE` 免费;每轮上限 64 个对象,存量平滑消化。 |
+| **Manifest PUT** | 实际触发回收的轮次增加 2 次小对象 manifest PUT(摘除注册 + 清理队列);空闲轮次为 **0** 次 PUT。 |
+| **重启 GET 开销** | 从 `O(全量历史段数)` 降至 `O(仅未确认段数)`,消除长稳运行后的重启线性劣化。 |
+
 ## 综合运用
 
 ### 高吞吐批处理作业
@@ -252,19 +295,21 @@ durability:
 
 - `parallel_put.workers` 必须为 1-8(拒绝 0)
 - `compression.level` 必须在算法范围内(zstd 0-22,lz4 1-16)
+- `retention.max_age` 设置时必须大于 0(需要立即回收请设 `retention.max_segments: 0` 或省略三项上限)
 - 既有检查:`node_id` 与 `stream_id` 非空、`bucket` 非空、`object_store` 拒绝 `sync: per_entry`
 
 无效配置会让 `Stream::run` 在启动时返回 `Err`,引擎快速失败而非静默降级。
 
 ## 向后兼容
 
-旧配置(不含 `segment_tuning`、`parallel_put` 或 `compression`)继续可用——这些新字段的默认值为:
+旧配置(不含 `segment_tuning`、`parallel_put`、`compression` 或 `retention`)语法上继续兼容——这些字段的默认值为:
 
 - `segment_tuning.strategy: balanced`(与旧 `segment:` 参数相同)
 - `parallel_put.workers: 1`
 - `compression.type: none`
+- `retention.enabled: true`(三项上限均未设置——默认自动回收满足安全下界的已确认密封段)
 
-这意味着现有部署只要不显式启用新字段,行为就不会变化。
+**保留行为升级提示:**旧配置无需改动即可加载,但省略 `retention` 块现在会**默认启用**已确认密封段的自动删除。如你的部署依赖旧版“永不自动删除”的行为(例如外部直接读取 WAL 前缀中的历史段),请在升级前显式配置 `retention.enabled: false`。启用自动回收时,请确认部署使用的 IAM 角色/凭据具备 WAL segment 前缀的 `s3:DeleteObject`(或等价删除)权限,且对象存储支持 `manifest.json` 的条件 PUT(`If-Match`)。
 
 ## 示例配置
 

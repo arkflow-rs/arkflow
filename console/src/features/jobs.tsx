@@ -23,6 +23,8 @@ import {
   useRollbackJobUpgrade,
 } from '../queries'
 import { JobEditor as VisualJobEditor } from './job-editor'
+import { useCopilot } from './copilot'
+import type { JobSpec } from './job-dag'
 
 type JobsProps = {
   onError: (message: string) => void
@@ -127,8 +129,9 @@ export function Jobs({ onError, canMutate = true }: JobsProps) {
   const queryClient = useQueryClient()
   const reportMutationFailure = useMutationFailure()
   const confirm = useConfirm()
+  const copilot = useCopilot()
   const jobsQuery = useJobs()
-  const jobs = jobsQuery.data?.items ?? []
+  const jobs = useMemo(() => jobsQuery.data?.items ?? [], [jobsQuery.data?.items])
   const nodes = useNodes().data?.items ?? []
   const [selectedJobId, setSelectedJobId] = useState<string>()
   const detailQuery = useJobDetail(selectedJobId)
@@ -145,8 +148,27 @@ export function Jobs({ onError, canMutate = true }: JobsProps) {
     mode: 'create' | 'upgrade' | 'atomic'
     job?: Job
     savepoint?: JobCheckpoint
+    proposalSpec?: { id: number; spec: JobSpec }
   }>()
   const [busy, setBusy] = useState('')
+  const pendingJobProposal = copilot.pendingJobProposal
+  useEffect(() => {
+    if (!pendingJobProposal) return
+    const targetId = pendingJobProposal.proposal.target_job_id
+    const targetJob =
+      pendingJobProposal.proposal.mode === 'upgrade' && targetId
+        ? jobs.find((item) => item.job_id === targetId)
+        : undefined
+    // eslint-disable-next-line react-hooks/set-state-in-effect -- opening VisualJobEditor from an explicit Copilot JobSpec proposal
+    setEditor({
+      mode: targetJob ? 'atomic' : 'create',
+      job: targetJob,
+      proposalSpec: {
+        id: pendingJobProposal.id,
+        spec: pendingJobProposal.proposal.spec as unknown as JobSpec,
+      },
+    })
+  }, [pendingJobProposal, jobs])
   const invalidateJobs = () => {
     void queryClient.invalidateQueries({ queryKey: ['live', 'jobs'] })
     void queryClient.invalidateQueries({ queryKey: ['live', 'job-detail'] })
@@ -242,9 +264,21 @@ export function Jobs({ onError, canMutate = true }: JobsProps) {
             <h3>{t('jobs.title')}</h3>
             <span>{t('jobs.countSummary', { visible: visible.length, total: jobs.length })}</span>
           </div>
-          <button disabled={!canMutate} onClick={() => setEditor({ mode: 'create' })}>
-            {t('jobs.createJob')}
-          </button>
+          <div className="actions">
+            {copilot.enabled && (
+              <button
+                type="button"
+                disabled={!canMutate}
+                title={!canMutate ? t('copilot.requiresConfigure') : undefined}
+                onClick={() => copilot.openWithContext({ page: '/jobs' })}
+              >
+                {t('copilot.aiBuildDag')}
+              </button>
+            )}
+            <button disabled={!canMutate} onClick={() => setEditor({ mode: 'create' })}>
+              {t('jobs.createJob')}
+            </button>
+          </div>
         </div>
         <div className="toolbar">
           <input
@@ -308,6 +342,23 @@ export function Jobs({ onError, canMutate = true }: JobsProps) {
                   {job.last_error && <small className="error-text">{job.last_error}</small>}
                 </div>
                 <div className="actions">
+                  {copilot.enabled && (
+                    <button
+                      type="button"
+                      onClick={() =>
+                        copilot.openWithContext(
+                          {
+                            page: '/jobs',
+                            job_id: job.job_id,
+                            error_summary: job.last_error ?? undefined,
+                          },
+                          t('copilot.promptDiagnoseJob', { jobId: job.job_id }),
+                        )
+                      }
+                    >
+                      {t('copilot.aiDiagnose')}
+                    </button>
+                  )}
                   <PauseResumeAction
                     job={job}
                     canMutate={canMutate}
@@ -347,12 +398,15 @@ export function Jobs({ onError, canMutate = true }: JobsProps) {
       )}
       {editor && (
         <VisualJobEditor
+          key={`${editor.mode}:${editor.job?.job_id ?? ''}:${editor.savepoint?.checkpoint_id ?? ''}:${editor.proposalSpec?.id ?? ''}`}
           mode={editor.mode}
           job={editor.job}
           savepoint={editor.savepoint}
           nodes={nodes}
           busy={!!busy}
           canMutate={canMutate}
+          proposalSpec={editor.proposalSpec}
+          onProposalConsumed={copilot.consumeJobProposal}
           onClose={() => setEditor(undefined)}
           onError={onError}
           onSaved={() => {

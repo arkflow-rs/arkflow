@@ -15,6 +15,8 @@ use std::sync::Arc;
 use std::time::{SystemTime, UNIX_EPOCH};
 use tokio::sync::{broadcast, RwLock};
 
+pub(crate) mod ai;
+pub(crate) mod ai_tools;
 mod approval;
 mod checkpoint;
 mod command_metrics;
@@ -50,6 +52,7 @@ mod session_report_tests;
 #[cfg(test)]
 mod tests;
 
+pub use ai::AiCopilotConfig;
 pub use command_metrics::CommandMetrics;
 pub use error::HubError;
 pub(crate) use identity::FederatedSessionAdmission;
