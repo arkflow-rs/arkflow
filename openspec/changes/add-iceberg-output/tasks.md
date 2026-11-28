@@ -1,7 +1,7 @@
 ## 1. Spike (go / no-go gate)
 
 - [x] 1.1 S1 dependencies: on a scratch branch add `iceberg`, `iceberg-catalog-rest`, and `iceberg-storage-opendal` (`opendal-s3`, `opendal-fs`, `opendal-memory`) as optional dependencies; confirm a single `arrow`/`parquet` 58.4 and a single `reqwest` 0.12 in `cargo tree`, and that the `Cargo.lock` diff only adds entries without changing an existing version
-- [ ] 1.2 Record the default cold-build time and release binary size delta against `main` in the PR description
+- [x] 1.2 Record the default cold-build time and release binary size delta against `main` in the PR description
 - [x] 1.3 S2 TLS: load a table through an `https://` catalog URI; if it fails, add an explicit `reqwest` 0.12 `rustls-tls` feature edge and record it
 - [x] 1.4 S3 schema: write an Arrow `RecordBatch` cast to `schema_to_arrow_schema(table.schema())` and read it back through a table scan; record whether field ids survive and whether decimals and maps are writable
 - [x] 1.5 S4 partitions: drive the upstream partition splitter and fan-out writer with identity and temporal transforms; record the supported transform list
@@ -10,6 +10,14 @@
 - [x] 1.8 S7 auth: confirm bearer-token auth and note whether OAuth2 client credentials and SigV4 are available in `iceberg-catalog-rest`
 - [x] 1.9 S8 duplicate check: confirm the default and the exact semantics of `with_check_duplicate`
 - [x] 1.10 Record every outcome under "Open Questions" in `design.md` and make the go / no-go call; a no-go on S1 stops the change before phase 2, and a switch of the watermark carrier updates the watermark requirement in the spec delta before phase 3
+
+基线实测（2026-11-28，本机 release + strip，两次全新冷构建）：
+
+| 口径 | default（含 iceberg） | 全家族减 iceberg | 变化 |
+| --- | --- | --- | --- |
+| 冷构建时间 | 1474s | 1274s | +200s（+15.7%） |
+| 二进制体积 | 159,410,000 B（152.0 MB） | 153,035,408 B（145.9 MB） | +6.1 MiB（+4.2%） |
+| cargo tree 行数 | 4070 | 3795 | +275（+7.2%） |
 
 ## 2. Feature and dependency layer
 
