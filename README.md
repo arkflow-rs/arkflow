@@ -204,6 +204,7 @@ ArkFlow supports multiple output targets:
 - **Kafka** (`kafka`): Write data to Kafka topics
 - **MQTT** (`mqtt`): Publish messages to MQTT topics
 - **HTTP** (`http`): Send data via HTTP
+- **Iceberg** (`iceberg`): Append rows to an existing Apache Iceberg table via a REST catalog, with optional exactly-once delivery from Kafka sources
 - **InfluxDB** (`influxdb`): Write time-series data to InfluxDB 2.x
 - **MongoDB** (`mongodb`): Write documents to a MongoDB collection
 - **NATS** (`nats`): Publish messages to NATS topics

@@ -1168,6 +1168,130 @@
     },
     {
       "kind": "output",
+      "name": "iceberg",
+      "description": "Appends rows to an existing Apache Iceberg table through a REST catalog. One write_batch call is one atomic table append; a batch processor in front of this output controls commit cadence and file size.",
+      "config_optional": false,
+      "config_schema": {
+        "type": "object",
+        "additionalProperties": false,
+        "properties": {
+          "catalog": {
+            "type": "object",
+            "description": "REST catalog connection.",
+            "properties": {
+              "uri": {
+                "type": "string",
+                "description": "REST catalog endpoint, e.g. http://lakekeeper:8181/catalog."
+              },
+              "warehouse": {
+                "type": "string",
+                "description": "Warehouse (catalog) name."
+              },
+              "token": {
+                "type": "string",
+                "description": "Static bearer token; may reference ${env:VAR} / ${file:/path} / ${secret:...}."
+              }
+            },
+            "required": [
+              "uri",
+              "warehouse"
+            ],
+            "additionalProperties": false
+          },
+          "namespace": {
+            "type": "string",
+            "description": "Namespace containing the table; split on '.' for multi-level namespaces."
+          },
+          "table": {
+            "type": "string",
+            "description": "Table name. The table must already exist; the output never creates tables or evolves schemas."
+          },
+          "exactly_once": {
+            "type": "boolean",
+            "description": "Drop replayed rows below the committed Kafka offset watermark. Requires a replayable source position on every row and an ordered single chain from the Kafka input.",
+            "default": false
+          },
+          "writer_id": {
+            "type": "string",
+            "description": "Watermark writer identity; required exactly when exactly_once is true. Use the Kafka consumer group id."
+          },
+          "write": {
+            "type": "object",
+            "description": "Write tuning; unset values follow the table's own write.* properties.",
+            "properties": {
+              "target_file_size_bytes": {
+                "type": "integer",
+                "minimum": 1,
+                "description": "Roll the data file after this many bytes. Only splits files inside one commit; does not drive commit cadence. Default: the table's write.target-file-size-bytes (512 MiB)."
+              },
+              "compression": {
+                "enum": [
+                  "snappy",
+                  "gzip",
+                  "zstd",
+                  "lz4"
+                ],
+                "description": "Parquet codec. Default: the table's write.parquet.compression-codec (snappy)."
+              }
+            },
+            "additionalProperties": false
+          },
+          "s3": {
+            "type": "object",
+            "description": "S3 storage overrides. When absent, storage config comes from the catalog server and credentials fall back to the environment.",
+            "properties": {
+              "endpoint": {
+                "type": "string",
+                "description": "S3 endpoint reachable from the host running ArkFlow; sent as a client property overriding the server default."
+              },
+              "region": {
+                "type": "string"
+              },
+              "access_key_id": {
+                "type": "string",
+                "description": "Static access key; set together with secret_access_key to avoid environment credential lookup."
+              },
+              "secret_access_key": {
+                "type": "string",
+                "description": "Static secret key; may reference ${env:VAR} / ${file:/path} / ${secret:...}."
+              },
+              "path_style_access": {
+                "type": "boolean",
+                "description": "Path-style addressing (required by MinIO).",
+                "default": true
+              }
+            },
+            "additionalProperties": false
+          }
+        },
+        "required": [
+          "catalog",
+          "namespace",
+          "table"
+        ]
+      },
+      "config_example": {
+        "catalog": {
+          "uri": "http://lakekeeper:8181/catalog",
+          "warehouse": "demo"
+        },
+        "namespace": "analytics",
+        "table": "user_events",
+        "exactly_once": true,
+        "writer_id": "arkflow-iceberg-ingest",
+        "write": {
+          "target_file_size_bytes": 33554432,
+          "compression": "zstd"
+        },
+        "s3": {
+          "endpoint": "http://minio:9000",
+          "region": "local-01",
+          "path_style_access": true
+        }
+      }
+    },
+    {
+      "kind": "output",
       "name": "influxdb",
       "description": "Writes time-series data to InfluxDB v2.x using the Line Protocol.",
       "config_optional": false,

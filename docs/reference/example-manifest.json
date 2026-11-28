@@ -282,6 +282,11 @@
       "name": "amqp09",
       "path": "../examples/amqp09_example.yaml",
       "kind": "yaml"
+    },
+    {
+      "name": "iceberg-output",
+      "path": "../examples/iceberg_output_example.yaml",
+      "kind": "yaml"
     }
   ]
 }

@@ -8,6 +8,7 @@ project follows [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 ## [Unreleased]
 
 ### Added — Engine & Durability
+- Output: new `iceberg` output — append rows to an existing Apache Iceberg table via a REST catalog (Lakekeeper tested); one `write_batch` is one atomic table append; optional exactly-once delivery via a Kafka source-position watermark; gated behind the new default-on `connectors-iceberg` feature.
 
 - Object-store (`s3`) WAL segment retention and crash-safe reclamation
   (`durability.backend.object_store.retention`: `enabled`, `max_segments`,
