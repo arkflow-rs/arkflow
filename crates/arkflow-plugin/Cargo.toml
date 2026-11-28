@@ -107,7 +107,7 @@ iceberg-storage-opendal = { workspace = true, optional = true }
 reqsign-core = { workspace = true, optional = true }
 
 # Compression (WAL segment optimization)
-zstd = "0.13"
+zstd = "0.14"
 lz4_flex = "0.14"
 
 # python
