@@ -37,18 +37,76 @@ helm template assert-multi "$CHART" --set unsafe.allowMultipleReplicas=true --se
   > "$TMP/multi.yaml"
 assert_contains "$TMP/multi.yaml" "replicas: 3" "unsafe: honored when opted in"
 
-echo "== control-plane render =="
+echo "== control-plane render (mTLS enabled by default) =="
 helm template arkflow "$CHART" -f "$CHART/values-controlplane.yaml" > "$TMP/cp.yaml"
 assert_contains "$TMP/cp.yaml" "name: arkflow-hub" "cp: hub deployment+service"
 assert_contains "$TMP/cp.yaml" "name: arkflow-console" "cp: console deployment+service"
 assert_contains "$TMP/cp.yaml" "kind: PersistentVolumeClaim" "cp: default SQLite PVC"
 assert_contains "$TMP/cp.yaml" "value: \"/var/lib/arkflow/hub.sqlite\"" "cp: sqlite storage env"
-assert_contains "$TMP/cp.yaml" "helm.sh/resource-policy: keep" "cp: kept node-token secret"
+assert_contains "$TMP/cp.yaml" "helm.sh/resource-policy: keep" "cp: kept secret"
+assert_contains "$TMP/cp.yaml" "name: arkflow-tls" "cp: generated TLS secret"
+assert_contains "$TMP/cp.yaml" "name: ARKFLOW_HUB_TLS_CA" "cp: hub CA env"
+assert_contains "$TMP/cp.yaml" "name: ARKFLOW_HUB_TLS_CLIENT_AUTH" "cp: hub client auth env"
+assert_contains "$TMP/cp.yaml" "value: \"agent_required\"" "cp: default agent_required client auth"
+assert_contains "$TMP/cp.yaml" "scheme: HTTPS" "cp: hub probes use HTTPS"
 assert_contains "$TMP/cp.yaml" "name: ARKFLOW_HUB_UPSTREAM" "cp: console upstream env"
-assert_contains "$TMP/cp.yaml" "value: \"http://arkflow-hub:8080\"" "cp: console targets in-chart hub"
+assert_contains "$TMP/cp.yaml" "value: \"https://arkflow-hub:8080\"" "cp: console targets https in-chart hub"
+assert_contains "$TMP/cp.yaml" "name: ARKFLOW_HUB_PROXY_SSL" "cp: console proxy SSL verification env"
+assert_contains "$TMP/cp.yaml" "proxy_ssl_verify on" "cp: console enables proxy_ssl_verify"
+assert_contains "$TMP/cp.yaml" "name: hub-ca" "cp: console mounts CA-only volume"
 assert_contains "$TMP/cp.yaml" "name: arkflow-agent" "cp: in-chart agent workload"
 assert_contains "$TMP/cp.yaml" "name: ARKFLOW_NODE_TOKEN" "cp: shared credential env"
+assert_contains "$TMP/cp.yaml" "name: ARKFLOW_NODE_CREDENTIAL_FILE" "cp: in-chart agent credential file env"
+assert_contains "$TMP/cp.yaml" "value: \"/var/lib/arkflow-agent/node_credential\"" "cp: in-chart agent uses Pod-scoped emptyDir path"
+assert_contains "$TMP/cp.yaml" "emptyDir: {}" "cp: in-chart agent uses Pod-scoped emptyDir volume"
+assert_contains "$TMP/cp.yaml" "name: ARKFLOW_AGENT_TLS_CERT" "cp: agent client cert env"
+assert_contains "$TMP/cp.yaml" "name: ARKFLOW_DATA_PLANE_TLS_CERT" "cp: data-plane cert env"
 assert_contains "$TMP/cp.yaml" "clusterIP: None" "cp: agent headless service"
+python3 - "$TMP/cp.yaml" <<'EOF'
+import sys
+docs = open(sys.argv[1]).read().split("\n---")
+agent = next((d for d in docs if "app.kubernetes.io/component: engine" in d and "kind: Deployment" in d), "")
+assert agent, "cp: missing engine Deployment"
+assert 'key: "ca.crt"' in agent and 'key: "agent.crt"' in agent and 'key: "agent.key"' in agent, "cp: agent-tls items projection incomplete"
+assert "hub.key" not in agent and "hub.crt" not in agent, "cp: hub TLS key/cert must never be mounted in agent deployment"
+console = next((d for d in docs if "app.kubernetes.io/component: console" in d and "kind: Deployment" in d), "")
+assert console, "cp: missing console Deployment"
+assert 'key: "ca.crt"' in console and "hub.key" not in console, "cp: console must mount only ca.crt"
+EOF
+
+echo "== pinned agent.nodeId requires persistent storage =="
+if helm template my-agent "$CHART" -f "$CHART/values-agent.yaml" --set agent.nodeId=fixed-edge-01 >"$TMP/pinfail.yaml" 2>"$TMP/pinfail.err"; then
+  fail "pinned-agent: expected render failure when persistence.enabled=false"
+fi
+assert_contains "$TMP/pinfail.err" "persistence.enabled=true" "pinned-agent: explicit persistence requirement"
+
+echo "== control-plane mTLS opt-out =="
+helm template arkflow "$CHART" -f "$CHART/values-controlplane.yaml" \
+  --set controlPlane.tls.enabled=false > "$TMP/cpnotls.yaml"
+assert_not_contains "$TMP/cpnotls.yaml" "name: arkflow-tls" "cp-no-tls: no generated TLS secret"
+assert_not_contains "$TMP/cpnotls.yaml" "name: ARKFLOW_HUB_TLS_CERT" "cp-no-tls: no hub TLS env"
+assert_not_contains "$TMP/cpnotls.yaml" "name: ARKFLOW_AGENT_TLS_CERT" "cp-no-tls: no agent TLS env"
+assert_not_contains "$TMP/cpnotls.yaml" "name: ARKFLOW_HUB_PROXY_SSL" "cp-no-tls: no console SSL env"
+assert_not_contains "$TMP/cpnotls.yaml" "scheme: HTTPS" "cp-no-tls: probes stay HTTP"
+assert_contains "$TMP/cpnotls.yaml" "value: \"http://arkflow-hub:8080\"" "cp-no-tls: console uses http upstream"
+
+echo "== control-plane rejects unsupported clientAuth=required =="
+if helm template arkflow "$CHART" -f "$CHART/values-controlplane.yaml" \
+  --set controlPlane.tls.clientAuth=required >"$TMP/cpreq.yaml" 2>"$TMP/cpreq.err"; then
+  fail "cp-required: expected clientAuth=required to fail chart render"
+fi
+assert_contains "$TMP/cpreq.err" "clientAuth=required" "cp-required: explicit error message"
+
+echo "== agent existingSecret TLS, fixed nodeId, and node credential persistence =="
+helm template my-agent "$CHART" -f "$CHART/values-agent.yaml" \
+  --set agent.tls.existingSecret=my-agent-tls --set agent.nodeId=fixed-edge-01 --set persistence.enabled=true > "$TMP/agenttls.yaml"
+assert_contains "$TMP/agenttls.yaml" "secretName: my-agent-tls" "agent-tls: mounts existing TLS secret"
+assert_contains "$TMP/agenttls.yaml" "value: \"fixed-edge-01\"" "agent-tls: fixed nodeId override honored"
+assert_contains "$TMP/agenttls.yaml" "name: ARKFLOW_AGENT_TLS_CA" "agent-tls: agent CA env"
+assert_contains "$TMP/agenttls.yaml" "name: ARKFLOW_AGENT_TLS_CERT" "agent-tls: agent cert env"
+assert_contains "$TMP/agenttls.yaml" "name: ARKFLOW_DATA_PLANE_TLS_CERT" "agent-tls: data-plane cert env"
+assert_contains "$TMP/agenttls.yaml" "name: ARKFLOW_NODE_CREDENTIAL_FILE" "agent-tls: persisted credential file env"
+assert_contains "$TMP/agenttls.yaml" "value: \"/app/data/node_credential\"" "agent-tls: credential file inside PVC mount"
 
 echo "== control-plane with postgres disables PVC =="
 helm template arkflow "$CHART" -f "$CHART/values-controlplane.yaml" \

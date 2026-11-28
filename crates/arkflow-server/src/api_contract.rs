@@ -419,6 +419,33 @@ pub struct RevokedTokensResponse {
     pub revoked_sessions: usize,
 }
 
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct CreateNodeCredentialRequest {
+    #[serde(default)]
+    pub label: Option<String>,
+    #[serde(default)]
+    pub expires_at_ms: Option<u64>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct NodeCredentialView {
+    pub credential_id: String,
+    pub node_id: String,
+    pub label: String,
+    pub created_at_ms: u64,
+    pub expires_at_ms: Option<u64>,
+    pub last_used_at_ms: Option<u64>,
+    pub revoked_at_ms: Option<u64>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct IssuedNodeCredentialResponse {
+    pub credential: NodeCredentialView,
+    /// Plaintext per-node token (`arkn_<credential_id>_<secret>`); returned
+    /// exactly once at issuance/rotation.
+    pub token: String,
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

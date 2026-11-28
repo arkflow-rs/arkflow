@@ -357,6 +357,10 @@ impl Fleet {
                     poll_interval: Duration::from_millis(AGENT_POLL_MS),
                     data_port: None,
                     data_host: None,
+                    node_credential_file: None,
+                    tls_ca: None,
+                    tls_cert: None,
+                    tls_key: None,
                 },
                 cancel.clone(),
             ));
@@ -395,6 +399,10 @@ impl Fleet {
                 poll_interval: Duration::from_millis(AGENT_POLL_MS),
                 data_port: None,
                 data_host: None,
+                node_credential_file: None,
+                tls_ca: None,
+                tls_cert: None,
+                tls_key: None,
             };
             agent.task = tokio::spawn(agent::run(empty_control_plane(), config, cancel));
         }

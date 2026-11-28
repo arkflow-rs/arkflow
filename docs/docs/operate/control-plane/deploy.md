@@ -164,27 +164,49 @@ in the clear. Treat snapshot files with the same care as the database itself
 **Control plane.** Set both `ARKFLOW_HUB_TLS_CERT` and `ARKFLOW_HUB_TLS_KEY`
 (PEM file paths) and the Hub serves every request over TLS — routes, auth,
 and readiness semantics are unchanged. Only one of the two fails startup.
- Agents reach a TLS Hub with an `https://` entry in `hub_urls` and no
-extra configuration. Without both variables the Hub binds plaintext exactly as
-before.
+To enforce **mTLS**, also set `ARKFLOW_HUB_TLS_CA` (PEM trust bundle) and
+optionally `ARKFLOW_HUB_TLS_CLIENT_AUTH`:
+
+| Variable | Default | Description |
+| --- | --- | --- |
+| `ARKFLOW_HUB_TLS_CA` | unset | PEM root/intermediate CA bundle for verifying client certificates on the Hub listener. |
+| `ARKFLOW_HUB_TLS_CLIENT_AUTH` | `agent_required` (when CA is set) | `agent_required` requires a verified client cert on `/api/v1/agent/*` while keeping `/health`, `/readiness`, `/liveness`, and operator/Console paths reachable over TLS; `required` requires a client cert on every endpoint; `none` disables client cert verification. Setting a client-auth mode other than `none` without `ARKFLOW_HUB_TLS_CA` or TLS cert/key fails startup. |
+
+On the Agent side, set `ARKFLOW_AGENT_TLS_CA` (or `health_check.tls_ca`) to trust
+the Hub CA and `ARKFLOW_AGENT_TLS_CERT` + `ARKFLOW_AGENT_TLS_KEY` (paired;
+setting only one fails startup) to present a client certificate during
+`/api/v1/agent/*` calls. When a peer certificate carries a Subject Alternative
+Name URI `urn:arkflow:node:<node_id>`, the Hub strictly binds `/api/v1/agent/*`
+requests to `<node_id>` (mismatches fail closed with `401`). Certificates
+without a `urn:arkflow:node:` SAN still authenticate via the Hub CA plus the
+node's credential.
 
 **Data plane (cross-node shuffle).** Set `ARKFLOW_DATA_PLANE_TLS_CERT`,
 `ARKFLOW_DATA_PLANE_TLS_KEY`, and `ARKFLOW_DATA_PLANE_TLS_CA` together — the
 node's certificate, its private key, and the fleet CA — and every
 cross-node connection runs mTLS: each side must present a certificate
 chaining to the fleet CA before any frame (including the HMAC session
-handshake) is exchanged. Node certificates must carry the SAN
-`DNS:arkflow-data-plane` (the fixed verification name; node identity itself
-is still proven by the HMAC handshake). A partial set of variables is
-ignored with a warning. Generate a fleet CA and node certificates with
-openssl, for example:
+handshake) is exchanged. Node certificates must carry `DNS:arkflow-data-plane`
+and may additionally include `URI:urn:arkflow:node:<node_id>` so peers bind the
+transport certificate directly to the expected source/destination node id
+(certificates without `urn:arkflow:node:` remain accepted for rolling
+compatibility). A partial set of variables is ignored with a warning. Generate
+a fleet CA and certificates with OpenSSL, for example:
 
 ```bash
 # Fleet CA
-openssl req -x509 -newkey rsa:2048 -nodes -keyout ca.key -out ca.pem   -subj "/CN=arkflow-fleet-ca" -days 3650
-# Per node (repeat per compute node)
-openssl req -newkey rsa:2048 -nodes -keyout node.key -out node.csr   -subj "/CN=arkflow-node"
-openssl x509 -req -in node.csr -CA ca.pem -CAkey ca.key -out node.pem   -days 365 -extfile <(echo "subjectAltName=DNS:arkflow-data-plane")
+openssl req -x509 -newkey rsa:2048 -nodes -keyout ca.key -out ca.pem \
+  -subj "/CN=arkflow-fleet-ca" -days 3650
+# Hub server cert
+openssl req -newkey rsa:2048 -nodes -keyout hub.key -out hub.csr \
+  -subj "/CN=arkflow-hub"
+openssl x509 -req -in hub.csr -CA ca.pem -CAkey ca.key -out hub.pem \
+  -days 365 -extfile <(echo "subjectAltName=DNS:arkflow-hub,DNS:localhost,IP:127.0.0.1")
+# Per node (repeat per compute node; add URI:urn:arkflow:node:<node_id> for strict SAN binding)
+openssl req -newkey rsa:2048 -nodes -keyout node.key -out node.csr \
+  -subj "/CN=arkflow-node"
+openssl x509 -req -in node.csr -CA ca.pem -CAkey ca.key -out node.pem \
+  -days 365 -extfile <(echo "subjectAltName=DNS:arkflow-data-plane,URI:urn:arkflow:node:node-a")
 ```
 
 Enable TLS on every compute node before relying on split placement:
@@ -192,35 +214,72 @@ during a rolling enable, plaintext and TLS nodes cannot talk to each other
 (connections fail closed). Certificate rotation means restarting the
 process (automatic renewal is out of scope).
 
+### Node identity and per-node credentials
+
+On a durable Hub (SQLite or PostgreSQL, schema v7 `cp_node_credentials`), each
+compute node authenticates with a **per-node opaque credential**
+(`arkn_<credential_id>_<secret>`), hashed at rest as
+`SHA-256(credential_id ‖ 0x00 ‖ secret)` and compared in constant time. Every
+per-node credential is strictly bound to one `node_id` — presenting node A's
+credential with `node_id = node-b` fails closed with `401` and emits a
+`node_identity_mismatch` audit record under the `"node"` category.
+
+Two enrollment models are supported:
+
+1. **Bootstrap enrollment (default for zero-touch bring-up):** when a node with
+   no active per-node credentials registers using the shared bootstrap
+   `node_token`, the Hub mints a `"bootstrap"` per-node credential and returns it
+   once in `RegisterResponse.node_credential`. The Agent retains this
+   credential in memory for subsequent reconnects and, when
+   `ARKFLOW_NODE_CREDENTIAL_FILE` (or `health_check.node_credential_file`) is
+   configured, atomically persists it with mode `0600` across restarts. Once a
+   `node_id` holds at least one active per-node credential, further shared
+   `node_token` registrations for that `node_id` are rejected (`401`, audited
+   as `bootstrap_blocked_enrolled_node`).
+2. **Pre-provisioned / zero-bootstrap enrollment:** operators with
+   `ManageNodes` privilege can pre-issue per-node credentials via
+   `POST /api/v1/nodes/{node_id}/credentials`, rotate via
+   `POST /api/v1/node-credentials/{credential_id}/rotate`, and revoke via
+   `DELETE /api/v1/node-credentials/{credential_id}` (revocation and rotation
+   immediately invalidate active sessions backed by that credential). Up to 8
+   active credentials are permitted per node.
+
+Control-plane bootstrap/break-glass switches on the Hub:
+
+| Variable | Default | Description |
+| --- | --- | --- |
+| `ARKFLOW_HUB_NODE_BOOTSTRAP_DISABLED` | `false` | Set `true` to disable shared `node_token` bootstrap enrollment entirely; every node must present a pre-provisioned `arkn_*` credential. |
+| `ARKFLOW_ALLOW_SHARED_NODE_TOKEN_BREAK_GLASS` | `false` | Emergency recovery override: allows already-enrolled nodes to re-register using the shared `node_token` (audited). Keep `false` in normal operation. |
+
 ### Data plane authentication and secrets
 
 Cross-node shuffle frames are authenticated at the application layer (wire
 protocol v2) independently of TLS: the session handshake exchanges fresh
 nonces in both directions and derives per-connection, per-direction session
-keys from the shared secret; every subsequent frame (data, signal, receipt)
-carries a truncated HMAC tag over its header, payload, and a
-connection-level monotonic sequence number, verified before any payload
-parsing. Forged, modified, or replayed frames fail closed as deterministic
-protocol errors. mTLS (above) stays the opt-in layer for confidentiality;
-frame authentication is always on.
+keys; every subsequent frame (data, signal, receipt) carries a truncated HMAC
+tag over its header, payload, and a connection-level monotonic sequence number,
+verified before any payload parsing. Forged, modified, or replayed frames fail
+closed as deterministic protocol errors.
 
-**Secret configuration (BREAKING).** The shared secret comes exclusively
-from `ARKFLOW_DATA_PLANE_SECRET`. The previous fallback to the fleet-shared
-`node_token` was removed: a leaked registration token no longer reveals the
-shuffle secret. A node without an explicit secret runs colocated-only
-(startup warning, no data-plane listener). Set the same secret on every
-node that participates in shuffle. The value is used **as written** —
-`${secret:...}`/`${env:...}` references are resolved only in configuration
-files, never in this environment variable. Note the trust boundary this
-does NOT create: every participating Agent holds the same shuffle secret,
-so a compromised shuffle Agent still holds it — rotate the shared secret
-(restart all Agents with the new value) whenever it may be exposed.
+**Per-edge Hub-provisioned secrets & mTLS.** For `split` jobs, the Hub caches a
+fresh 32-byte random secret per directed node pair `(src_node, dst_node)` and
+`(job_id, generation)` and delivers **only** the edges touching a given node in
+`job_start.payload.edge_secrets` (secrets are evicted when the job stops or
+advances generation). Inbound handshake authentication resolves the matching
+per-edge secret and verifies the MAC before claiming replay nonces, isolating
+each edge from unrelated nodes in the same job. Agents running data-plane mTLS
+(`ARKFLOW_DATA_PLANE_TLS_*`) start in `hub_provisioned` mode automatically and
+no longer require a fleet-wide `ARKFLOW_DATA_PLANE_SECRET` (nodes without mTLS
+and without `ARKFLOW_DATA_PLANE_SECRET` still run colocated-only with a startup
+warning). The shared `ARKFLOW_DATA_PLANE_SECRET` env remains supported as a
+fallback when configuring static fleet keys (note: without per-edge Hub keys
+and mTLS, every node sharing `ARKFLOW_DATA_PLANE_SECRET` holds the same
+key material). The value of `ARKFLOW_DATA_PLANE_SECRET` is used **as written**
+— `${secret:...}` / `${env:...}` references are not expanded inside it.
 
 **Upgrade window.** The v2 wire format is not interoperable with v1: in a
 mixed-version fleet the data-plane handshake fails closed. Stop distributed
-jobs, upgrade every Agent, and restart. If you previously relied on the
-`node_token` fallback, configure `ARKFLOW_DATA_PLANE_SECRET` on every node
-BEFORE upgrading.
+jobs, upgrade Hub and every Agent, and restart.
 
 **Optional tuning** — every variable is optional; unset keeps the default:
 

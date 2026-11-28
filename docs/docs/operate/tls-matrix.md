@@ -12,6 +12,9 @@ generate, drop, stdout, and pure-compute processors) have no TLS surface.
 
 | Component | TLS mechanism |
 |-----------|--------------|
+| control-plane Hub (`arkflow-server`) | `ARKFLOW_HUB_TLS_CERT` + `ARKFLOW_HUB_TLS_KEY`; add `ARKFLOW_HUB_TLS_CA` + `ARKFLOW_HUB_TLS_CLIENT_AUTH` (`agent_required` \| `required` \| `none`) for mTLS with optional `urn:arkflow:node:<id>` SAN binding |
+| control-plane Agent (`arkflow`) | `https://` in `health_check.hub_urls`, `ARKFLOW_AGENT_TLS_CA` (`tls_ca`), plus paired `ARKFLOW_AGENT_TLS_CERT` / `ARKFLOW_AGENT_TLS_KEY` (`tls_cert` / `tls_key`) |
+| data-plane shuffle (Agent ↔ Agent) | `ARKFLOW_DATA_PLANE_TLS_CA` + `ARKFLOW_DATA_PLANE_TLS_CERT` + `ARKFLOW_DATA_PLANE_TLS_KEY` (`DNS:arkflow-data-plane` + optional `URI:urn:arkflow:node:<id>`); enables `hub_provisioned` per-edge HMAC keys without `ARKFLOW_DATA_PLANE_SECRET` |
 | kafka (input/output) | rdkafka `security.protocol` + broker/CA config |
 | mqtt (input/output) | `tls` block (`enabled`, `ca`, `client_cert`, `client_key`) |
 | nats (input/output) | `tls://` URL scheme (native async-nats negotiation) |

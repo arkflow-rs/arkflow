@@ -32,6 +32,11 @@ pub struct RegisterResponse {
     pub lease_ttl_ms: u64,
     pub poll_interval_ms: u64,
     pub protocol_version: String,
+    /// Per-node credential minted once during initial bootstrap enrollment on a
+    /// durable Hub (`arkn_<credential_id>_<secret>`). Omitted when already
+    /// enrolled or on a volatile Hub.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub node_credential: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

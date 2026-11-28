@@ -20,17 +20,26 @@ fn labels_config(operator_token: &str, approval_required: bool) -> hub::HubConfi
     }
 }
 
-async fn register_node(hub: &hub::Hub, node_id: &str) {
+async fn register_node(hub: &hub::Hub, node_id: &str) -> Option<String> {
+    register_node_with_token(hub, node_id, "node-secret").await
+}
+
+async fn register_node_with_token(
+    hub: &hub::Hub,
+    node_id: &str,
+    node_token: &str,
+) -> Option<String> {
     hub.register(hub::RegisterRequest {
         data_address: None,
         node_id: node_id.into(),
-        node_token: "node-secret".into(),
+        node_token: node_token.into(),
         protocol_version: "v1".into(),
         capabilities: vec![],
         boot_id: None,
     })
     .await
-    .unwrap();
+    .unwrap()
+    .node_credential
 }
 
 /// Auth and validation matrix over the label replacement route.
@@ -133,7 +142,7 @@ async fn labels_filter_and_re_registration_hydration() {
     let store = crate::storage::ControlPlaneStore::contract("labels_filter_hydration").await;
     let storage = crate::storage::StorageActor::start(store, 8);
     let hub = hub::Hub::with_storage(labels_config("root|admin|admin-secret", false), storage);
-    register_node(&hub, "node-a").await;
+    let cred_a = register_node(&hub, "node-a").await;
     register_node(&hub, "node-b").await;
     let app = hub_router(hub.clone(), &ServerConfig::default());
 
@@ -184,7 +193,7 @@ async fn labels_filter_and_re_registration_hydration() {
 
     // Re-registration keeps the labels (fresh in-memory resource is
     // re-hydrated from storage; the upsert never touches the column).
-    register_node(&hub, "node-a").await;
+    register_node_with_token(&hub, "node-a", cred_a.as_deref().unwrap_or("node-secret")).await;
     let (status, body) = get_json(&app, "/api/v1/nodes", "admin-secret").await;
     assert_eq!(status, StatusCode::OK, "{body}");
     let node_a = body["items"]

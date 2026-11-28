@@ -253,3 +253,171 @@ pub(super) async fn hub_set_maintenance(
         Err(error) => hub_problem(error),
     }
 }
+
+fn node_credential_view(
+    record: crate::storage::NodeCredentialRecord,
+) -> crate::api_contract::NodeCredentialView {
+    crate::api_contract::NodeCredentialView {
+        credential_id: record.credential_id,
+        node_id: record.node_id,
+        label: record.label,
+        created_at_ms: record.created_at_ms,
+        expires_at_ms: record.expires_at_ms,
+        last_used_at_ms: record.last_used_at_ms,
+        revoked_at_ms: record.revoked_at_ms,
+    }
+}
+
+fn node_credential_problem(error: hub::HubError) -> Response {
+    match error {
+        hub::HubError::NotFound => problem(
+            StatusCode::NOT_FOUND,
+            "credential_not_found",
+            error.to_string(),
+        ),
+        hub::HubError::Invalid(message) => {
+            problem(StatusCode::BAD_REQUEST, "invalid_credential", message)
+        }
+        hub::HubError::IdentityStoreUnavailable => problem(
+            StatusCode::SERVICE_UNAVAILABLE,
+            "identity_store_unavailable",
+            error.to_string(),
+        ),
+        hub::HubError::CredentialLimit => {
+            problem(StatusCode::CONFLICT, "credential_limit", error.to_string())
+        }
+        other => hub_problem(other),
+    }
+}
+
+pub(super) async fn hub_node_credentials(
+    State(hub): State<hub::Hub>,
+    Path(node_id): Path<String>,
+    headers: HeaderMap,
+) -> Response {
+    if let Err(response) = require_operator_action(
+        &hub,
+        &headers,
+        OperatorAction::ManageNodes,
+        "node",
+        Some(node_id.clone()),
+    )
+    .await
+    {
+        return response;
+    }
+    match hub.list_node_credentials(&node_id).await {
+        Ok(records) => {
+            let views: Vec<_> = records.into_iter().map(node_credential_view).collect();
+            Json(views).into_response()
+        }
+        Err(error) => node_credential_problem(error),
+    }
+}
+
+pub(super) async fn hub_create_node_credential(
+    State(hub): State<hub::Hub>,
+    Path(node_id): Path<String>,
+    headers: HeaderMap,
+    Json(request): Json<crate::api_contract::CreateNodeCredentialRequest>,
+) -> Response {
+    let principal = match require_operator_action(
+        &hub,
+        &headers,
+        OperatorAction::ManageNodes,
+        "node",
+        Some(node_id.clone()),
+    )
+    .await
+    {
+        Ok(principal) => principal,
+        Err(response) => return response,
+    };
+    let label = request.label.unwrap_or_default();
+    match hub
+        .create_node_credential(&node_id, &label, request.expires_at_ms, &principal.id)
+        .await
+    {
+        Ok((record, token)) => (
+            StatusCode::CREATED,
+            Json(crate::api_contract::IssuedNodeCredentialResponse {
+                credential: node_credential_view(record),
+                token,
+            }),
+        )
+            .into_response(),
+        Err(error) => node_credential_problem(error),
+    }
+}
+
+pub(super) async fn hub_rotate_node_credential(
+    State(hub): State<hub::Hub>,
+    Path(credential_id): Path<String>,
+    headers: HeaderMap,
+) -> Response {
+    let existing = match hub.get_node_credential(&credential_id).await {
+        Ok(existing) => existing,
+        Err(error) => return node_credential_problem(error),
+    };
+    let target_node = existing.as_ref().map(|record| record.node_id.clone());
+    let principal = match require_operator_action(
+        &hub,
+        &headers,
+        OperatorAction::ManageNodes,
+        "node",
+        target_node,
+    )
+    .await
+    {
+        Ok(principal) => principal,
+        Err(response) => return response,
+    };
+    if existing.is_none() {
+        return node_credential_problem(hub::HubError::NotFound);
+    }
+    match hub
+        .rotate_node_credential(&credential_id, &principal.id)
+        .await
+    {
+        Ok((record, token)) => Json(crate::api_contract::IssuedNodeCredentialResponse {
+            credential: node_credential_view(record),
+            token,
+        })
+        .into_response(),
+        Err(error) => node_credential_problem(error),
+    }
+}
+
+pub(super) async fn hub_revoke_node_credential(
+    State(hub): State<hub::Hub>,
+    Path(credential_id): Path<String>,
+    headers: HeaderMap,
+) -> Response {
+    let existing = match hub.get_node_credential(&credential_id).await {
+        Ok(existing) => existing,
+        Err(error) => return node_credential_problem(error),
+    };
+    let target_node = existing.as_ref().map(|record| record.node_id.clone());
+    let principal = match require_operator_action(
+        &hub,
+        &headers,
+        OperatorAction::ManageNodes,
+        "node",
+        target_node,
+    )
+    .await
+    {
+        Ok(principal) => principal,
+        Err(response) => return response,
+    };
+    if existing.is_none() {
+        return node_credential_problem(hub::HubError::NotFound);
+    }
+    match hub
+        .revoke_node_credential(&credential_id, &principal.id)
+        .await
+    {
+        Ok(revoked) => Json(serde_json::json!({ "revoked": revoked })).into_response(),
+        Err(error) => node_credential_problem(error),
+    }
+}

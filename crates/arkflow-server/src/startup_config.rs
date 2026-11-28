@@ -184,6 +184,20 @@ pub fn apply_env_overrides(cfg: &mut HubStartupConfig, env: &dyn Fn(&str) -> Opt
     if let Some(value) = text("ARKFLOW_HUB_TLS_KEY") {
         cfg.server.tls_key = Some(value);
     }
+    if let Some(value) = text("ARKFLOW_HUB_TLS_CA") {
+        cfg.server.tls_ca = Some(value);
+    }
+    if let Some(value) = text("ARKFLOW_HUB_TLS_CLIENT_AUTH") {
+        cfg.server.tls_client_auth = Some(value);
+    }
+    flag(
+        "ARKFLOW_HUB_NODE_BOOTSTRAP_DISABLED",
+        &mut cfg.server.node_bootstrap_disabled,
+    );
+    flag(
+        "ARKFLOW_ALLOW_SHARED_NODE_TOKEN_BREAK_GLASS",
+        &mut cfg.server.allow_shared_node_token_break_glass,
+    );
     flag("ARKFLOW_HUB_INSECURE_LOCAL", &mut cfg.server.insecure_local);
     flag(
         "ARKFLOW_APPROVAL_REQUIRED",

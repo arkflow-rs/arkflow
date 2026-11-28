@@ -32,6 +32,8 @@ pub struct RemoteEdgeContext {
     pub tls: Option<super::remote::DataPlaneTlsConfig>,
     /// Job attempt generation bound into authenticated data-plane sessions.
     pub generation: u64,
+    /// Optional Hub-provisioned per-edge HMAC secrets keyed by `(src_node, dst_node)`.
+    pub edge_secrets: BTreeMap<(String, String), String>,
 }
 
 /// Deterministic routing index for quad identities: the operator's position
@@ -78,6 +80,130 @@ impl RemoteEdgeContext {
                 ))
             })
     }
+}
+
+/// Computes live endpoint and per-edge secret updates for every remote edge
+/// touching `local_task_ids`, preserving existing in-process channels and state.
+pub fn build_live_edge_updates(
+    plan: &JobPlan,
+    local_task_ids: &[String],
+    remote: &RemoteEdgeContext,
+) -> Result<Vec<super::remote::LiveEdgeUpdate>, Error> {
+    plan.validate_side_edge_nodes(&remote.task_nodes)?;
+    plan.validate_affinity_nodes(&remote.task_nodes)?;
+    let index = PlanIndex::new(plan);
+    let local_set: BTreeSet<&str> = local_task_ids.iter().map(String::as_str).collect();
+    let operator_index = operator_routing_index(plan);
+    let mut updates = Vec::new();
+    let mut seen_outbound = BTreeSet::new();
+    let mut seen_inbound = BTreeSet::new();
+
+    for task in &plan.tasks {
+        if !local_set.contains(task.id.as_str()) {
+            continue;
+        }
+        if let Some(downstream_ops) = index.downstream.get(task.operator_id.as_str()) {
+            for downstream_operator in downstream_ops {
+                for target_task in plan
+                    .tasks
+                    .iter()
+                    .filter(|candidate| candidate.operator_id == *downstream_operator)
+                {
+                    if local_set.contains(target_task.id.as_str())
+                        || remote.node_of(&target_task.id)? == remote.local_node
+                    {
+                        continue;
+                    }
+                    if !seen_outbound.insert((task.id.as_str(), target_task.id.as_str())) {
+                        continue;
+                    }
+                    let quad = super::remote::Quad {
+                        src_op: *operator_index.get(&task.operator_id).ok_or_else(|| {
+                            Error::Config(format!(
+                                "operator '{}' has no routing index",
+                                task.operator_id
+                            ))
+                        })?,
+                        src_subtask: task.subtask,
+                        dst_op: *operator_index
+                            .get(&target_task.operator_id)
+                            .ok_or_else(|| {
+                                Error::Config(format!(
+                                    "operator '{}' has no routing index",
+                                    target_task.operator_id
+                                ))
+                            })?,
+                        dst_subtask: target_task.subtask,
+                    };
+                    let peer_node = remote.node_of(&target_task.id)?.to_owned();
+                    let addr = *remote.node_addrs.get(&peer_node).ok_or_else(|| {
+                        Error::Config(format!(
+                            "no data-plane address for remote node '{peer_node}'"
+                        ))
+                    })?;
+                    let secret = remote
+                        .edge_secrets
+                        .get(&(remote.local_node.clone(), peer_node.clone()))
+                        .map(|secret| secret.as_bytes().to_vec());
+                    updates.push(super::remote::LiveEdgeUpdate {
+                        quad,
+                        is_outbound: true,
+                        peer_node,
+                        peer_addr: Some(addr),
+                        edge_secret: secret,
+                    });
+                }
+            }
+        }
+
+        if let Some(upstream_ops) = index.upstream.get(task.operator_id.as_str()) {
+            for upstream_operator in upstream_ops {
+                for upstream_task in plan
+                    .tasks
+                    .iter()
+                    .filter(|candidate| candidate.operator_id == *upstream_operator)
+                {
+                    if local_set.contains(upstream_task.id.as_str())
+                        || remote.node_of(&upstream_task.id)? == remote.local_node
+                    {
+                        continue;
+                    }
+                    if !seen_inbound.insert((upstream_task.id.as_str(), task.id.as_str())) {
+                        continue;
+                    }
+                    let quad = super::remote::Quad {
+                        src_op: *operator_index.get(*upstream_operator).ok_or_else(|| {
+                            Error::Config(format!(
+                                "operator '{upstream_operator}' has no routing index"
+                            ))
+                        })?,
+                        src_subtask: upstream_task.subtask,
+                        dst_op: *operator_index.get(&task.operator_id).ok_or_else(|| {
+                            Error::Config(format!(
+                                "operator '{}' has no routing index",
+                                task.operator_id
+                            ))
+                        })?,
+                        dst_subtask: task.subtask,
+                    };
+                    let peer_node = remote.node_of(&upstream_task.id)?.to_owned();
+                    let secret = remote
+                        .edge_secrets
+                        .get(&(peer_node.clone(), remote.local_node.clone()))
+                        .map(|secret| secret.as_bytes().to_vec());
+                    updates.push(super::remote::LiveEdgeUpdate {
+                        quad,
+                        is_outbound: false,
+                        peer_node,
+                        peer_addr: None,
+                        edge_secret: secret,
+                    });
+                }
+            }
+        }
+    }
+
+    Ok(updates)
 }
 
 /// An outbound edge endpoint from a task inside a chain.
@@ -888,15 +1014,21 @@ impl ExecutionGraphBuilder {
                             addr,
                             max_attempts: 5,
                             tls: ctx.tls.clone(),
+                            peer_node: Some(node.to_owned()),
                         });
+                        let edge_secret = ctx
+                            .edge_secrets
+                            .get(&(ctx.local_node.clone(), node.to_owned()))
+                            .map(|secret| secret.as_bytes());
                         let sender = ctx
                             .manager
-                            .open_edge_deferred_for_job(
+                            .open_edge_deferred_for_job_with_secret(
                                 transport,
                                 quad,
                                 node.to_owned(),
                                 plan.spec.id.to_string(),
                                 ctx.generation,
+                                edge_secret,
                             )?
                             .sender;
                         senders.insert((upstream_task_id.clone(), target.clone()), sender);
@@ -946,14 +1078,20 @@ impl ExecutionGraphBuilder {
                             dst_subtask: task.subtask,
                         };
                         let (sender, receiver) = flume::bounded(self.channel_capacity);
-                        ctx.manager.register_inbound_for_session(
+                        let upstream_node = ctx.node_of(&upstream_task.id)?.to_owned();
+                        let edge_secret = ctx
+                            .edge_secrets
+                            .get(&(upstream_node.clone(), ctx.local_node.clone()))
+                            .map(|secret| secret.as_bytes());
+                        ctx.manager.register_inbound_for_session_with_secret(
                             quad,
                             sender,
                             super::remote::PeerExpectation {
-                                source_node: ctx.node_of(&upstream_task.id)?.to_owned(),
+                                source_node: upstream_node,
                                 job_id: plan.spec.id.to_string(),
                                 generation: ctx.generation,
                             },
+                            edge_secret,
                         )?;
                         let entry_run = *run_of_task.get(task.id.as_str()).ok_or_else(|| {
                             Error::Config(format!("task '{}' lost its run", task.id))

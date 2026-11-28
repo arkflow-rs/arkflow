@@ -5,7 +5,8 @@
 #     --values values-controlplane.yaml
 #
 # The release name matters: the agent's config must point hub_urls at the
-# in-chart Hub service http://<release-name>-hub:8080.
+# in-chart Hub service https://<release-name>-hub:8080 (TLS is enabled by
+# default via controlPlane.tls.enabled=true).
 mode: control-plane
 
 controlPlane:
@@ -27,9 +28,10 @@ persistence:
   size: 5Gi
 
 # Engine config for the in-chart agent. node_id defaults to the pod name;
-# ARKFLOW_NODE_TOKEN is injected by the chart from the shared Secret.
+# ARKFLOW_NODE_TOKEN, ARKFLOW_AGENT_TLS_*, and ARKFLOW_DATA_PLANE_TLS_* are
+# injected by the chart from the generated Secrets.
 config: |
   health_check:
     address: "0.0.0.0:8080"
-    hub_urls: ["http://arkflow-hub:8080"]
+    hub_urls: ["https://arkflow-hub:8080"]
   streams: []

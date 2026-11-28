@@ -93,11 +93,16 @@ mode: agent
 
 agent:
   dataPort: 9090
+  tls:
+    existingSecret: arkflow-agent-tls
+
+persistence:
+  enabled: true
 
 config: |
   health_check:
     address: "0.0.0.0:8080"
-    hub_urls: ["http://arkflow-hub:8080"]
+    hub_urls: ["https://arkflow-hub:8080"]
     # node_id omitted: defaults to the pod name (ARKFLOW_NODE_ID)
 
 env:
@@ -108,19 +113,31 @@ env:
         key: node_token
 ```
 
-- Node identity defaults to the pod name via the downward API; the engine
-  reads `ARKFLOW_NODE_ID` natively when the config sets no `node_id`.
-- The registration credential arrives as `ARKFLOW_NODE_TOKEN` from a Secret.
-- The data-plane shuffle port is exposed through a headless Service. The
-  engine refuses to serve the data plane without fleet credentials — see the
-  [TLS matrix](./tls-matrix.md) before relying on split placement.
+- Node identity defaults to the pod name via the downward API when `config`
+  sets no `node_id` and `agent.nodeId` is empty, or set `agent.nodeId` to pin a
+  fixed `ARKFLOW_NODE_ID`.
+- Supply the bootstrap credential via `ARKFLOW_NODE_TOKEN` from a Secret, and
+  enable `persistence.enabled: true` so the chart wires
+  `ARKFLOW_NODE_CREDENTIAL_FILE` (`/app/data/node_credential`) and retains the
+  Hub-enrolled `arkn_` credential across restarts. Because enrolled `arkn_`
+  credentials stay bound to their original `node_id`, pairing persistence with a
+  mutable Deployment Pod name across Pod replacements causes
+  `node_identity_mismatch`; use `agent.nodeId` (for a single fixed node), deploy
+  as a `StatefulSet` for stable Pod names, or delete the stale
+  `node_credential` file before starting a new `node_id` (while bootstrap is
+  enabled).
+- Set `agent.tls.existingSecret` (`ca.crt`, `tls.crt`, `tls.key`) to mount CA
+  and client/data-plane certificates for Hub mTLS (`ARKFLOW_AGENT_TLS_*`) and
+  cross-node shuffle (`ARKFLOW_DATA_PLANE_TLS_*`). Without TLS or a data-plane
+  secret, the engine refuses split shuffle — see the
+  [TLS matrix](./tls-matrix.md).
 
 ## Control-plane mode
 
 `mode: control-plane` renders the full distributed runtime in one release:
 the Hub (`arkflow-server` image), the Console (static UI behind a same-origin
-nginx proxy), a shared node-credential Secret, and an optional in-chart
-agent joining the in-chart Hub.
+nginx proxy), a bootstrap node-credential Secret, Fleet CA + Hub/Agent mTLS
+certificates, and an optional in-chart agent joining the in-chart Hub.
 
 ```yaml validate=foreign reason="Helm values file"
 mode: control-plane
@@ -128,6 +145,7 @@ mode: control-plane
 controlPlane:
   # nodeToken unset => the chart generates and KEEPS a Secret across
   # upgrades and uninstalls (delete it manually when certain).
+  # tls.enabled defaults to true (mTLS for Hub, Agent, and data plane).
   hub:
     storage:
       # Default: SQLite on the persistence PVC. A postgres:// URL switches
@@ -143,12 +161,12 @@ controlPlane:
 config: |
   health_check:
     address: "0.0.0.0:8080"
-    hub_urls: ["http://<release-name>-hub:8080"]
+    hub_urls: ["https://<release-name>-hub:8080"]
 ```
 
-Storage and availability contract:
+Storage, mTLS, and availability contract:
 
-- **Default**: SQLite at `controlPlane.hub.storage.sqlitePath` on the
+- **Default storage**: SQLite at `controlPlane.hub.storage.sqlitePath` on the
   persistence PVC; the Hub Deployment is single-replica with `Recreate`
   updates (never two Hubs against one store).
 - **Postgres**: set `controlPlane.hub.storage.postgresURL` (env
@@ -157,16 +175,36 @@ Storage and availability contract:
 - **Migration** between backends stays a manual `arkflow-server migrate`
   operation (stop the Hub first) — see the
   [control-plane deployment](./control-plane/deploy.md) page.
+- **mTLS enabled by default (`controlPlane.tls.enabled: true`)**: on first
+  install the chart generates and keeps (`helm.sh/resource-policy: keep`) a
+  Fleet CA (10-year lifetime), Hub server cert, and Agent client/data-plane
+  cert (365-day leaf lifetime, reused while the Secret exists) in
+  `<release>-tls` (or point `controlPlane.tls.existingSecret` at your own),
+  configures Hub `ARKFLOW_HUB_TLS_{CA,CERT,KEY}` +
+  `ARKFLOW_HUB_TLS_CLIENT_AUTH=agent_required` with `HTTPS` probes (note:
+  `clientAuth=required` is rejected during chart rendering because kubelet HTTPS
+  probes and the Console proxy do not present client certificates), switches
+  `ARKFLOW_HUB_UPSTREAM` on the Console to `https://` with `proxy_ssl_verify on`
+  against the mounted Fleet CA, and mounts only CA + Agent client/data-plane
+  keys (`hub.key` excluded) onto the in-chart Agent. For long-lived clusters,
+  supply rotating certificates (e.g. `cert-manager`) via
+  `controlPlane.tls.existingSecret` or, before the 365-day leaf expiry,
+  delete `<release>-tls`, run `helm upgrade` to regenerate the Secret
+  (certificates are generated during Helm rendering, not at pod startup),
+  and then restart the Hub, Console, and Agent pods. Set
+  `controlPlane.tls.enabled=false` (and use `http://` in `hub_urls`) to opt
+  out to plaintext HTTP.
 
-The shared node credential feeds `ARKFLOW_NODE_TOKEN` on both the Hub and
+The shared bootstrap credential feeds `ARKFLOW_NODE_TOKEN` on both the Hub and
 the in-chart agent; the chart generates one into a Secret on first install
 (`helm.sh/resource-policy: keep`) unless `controlPlane.nodeToken.existingSecret`
 points at your own.
 
 The Console resolves its proxy target at container start from
-`ARKFLOW_HUB_UPSTREAM` — the chart sets it to the in-chart Hub Service, and
-the image default (`http://arkflow-hub:8080`) preserves standalone-console
-behavior outside the chart.
+`ARKFLOW_HUB_UPSTREAM` — the chart sets it to `https://<release>-hub:8080`
+(with `ARKFLOW_HUB_PROXY_SSL` enabling CA verification) or `http://` when TLS
+is disabled, and the image defaults (`http://arkflow-hub:8080`, empty
+`ARKFLOW_HUB_PROXY_SSL`) preserve standalone-console behavior outside the chart.
 
 ## Roadmap
 

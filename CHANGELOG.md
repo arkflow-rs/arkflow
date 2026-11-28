@@ -41,6 +41,43 @@ project follows [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Added — Control plane
 
+- **Per-node credentials, Hub/Agent mTLS, and per-edge data-plane keys**:
+  - Durable control-plane storage (`cp_node_credentials`, schema v7 in SQLite
+    and PostgreSQL, included in `migrate`/`backup`/`restore`) stores opaque
+    per-node credentials (`arkn_<credential_id>_<secret>`) as
+    `SHA-256(credential_id ‖ 0x00 ‖ secret)` hashes with constant-time
+    comparison and a cap of 8 active credentials per node. Credentials bind
+    strictly to a single `node_id`.
+  - On initial bootstrap against a durable Hub, registering with the shared
+    `node_token` mints a `"bootstrap"` credential once in
+    `RegisterResponse.node_credential`, retained by Agents in memory and
+    atomically saved (`0600`) to `ARKFLOW_NODE_CREDENTIAL_FILE` /
+    `health_check.node_credential_file`. Subsequent shared-token
+    registrations for already-enrolled nodes fail closed unless
+    `ARKFLOW_ALLOW_SHARED_NODE_TOKEN_BREAK_GLASS=true`; set
+    `ARKFLOW_HUB_NODE_BOOTSTRAP_DISABLED=true` to require pre-provisioned
+    credentials.
+  - Operator node-credential management routes
+    (`GET/POST /api/v1/nodes/{node_id}/credentials`,
+    `POST /api/v1/node-credentials/{credential_id}/rotate`,
+    `DELETE /api/v1/node-credentials/{credential_id}`) require `ManageNodes` on
+    `node_id`; rotation and revocation immediately invalidate active sessions.
+  - Node-attributed `"node"` audit records cover `agent.register`,
+    `node_credential.{create,enroll,rotate,revoke}`, `agent.auth_rejected`, and
+    terminal `agent.command_result` without ever recording secrets or hashes.
+  - Hub control-plane mTLS (`ARKFLOW_HUB_TLS_CA`,
+    `ARKFLOW_HUB_TLS_CLIENT_AUTH=agent_required|required|none`) and Agent TLS
+    (`ARKFLOW_AGENT_TLS_{CA,CERT,KEY}`) verify client certificates on
+    `/api/v1/agent/*` and strictly bind optional `URI:urn:arkflow:node:<id>`
+    SANs on both Hub requests and cross-node data-plane mTLS connections.
+  - `split` job placements generate cached per-`(job_id, generation)`
+    per-edge secrets filtered per touching node (`edge_secrets`), allowing
+    data-plane mTLS Agents (`ARKFLOW_DATA_PLANE_TLS_*`) to operate in
+    `hub_provisioned` mode without a fleet-wide `ARKFLOW_DATA_PLANE_SECRET`.
+  - The Helm chart (`mode: control-plane`) enables Hub/Agent/data-plane mTLS
+    by default (`controlPlane.tls.enabled: true` with explicit `false`
+    opt-out) and `mode: agent` supports `agent.tls.existingSecret` +
+    `ARKFLOW_NODE_CREDENTIAL_FILE` wiring when persistence is enabled.
 - `arkflow-server` accepts `--config <FILE>`: a full startup configuration
   file (YAML/JSON/TOML by extension) covering every `ServerConfig` field
   (including fields no environment variable can set — `api_prefix`, health

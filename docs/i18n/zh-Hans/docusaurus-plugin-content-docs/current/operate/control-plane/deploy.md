@@ -77,30 +77,58 @@ arkflow-server restore --from /backups/hub-2026-10-31.sqlite --to postgres://use
 
 ### TLS
 
-**控制面。**同时设置 `ARKFLOW_HUB_TLS_CERT` 与 `ARKFLOW_HUB_TLS_KEY`(PEM 文件路径),Hub 即以 TLS 承载全部请求——路由、认证与 readiness 语义不变。只配置其一会拒绝启动。Agent 用 `hub_urls` 中的 `https://` 条目访问 TLS Hub,无需额外配置。未同时配置时保持明文监听,行为与之前逐字节一致。
+**控制面。**同时设置 `ARKFLOW_HUB_TLS_CERT` 与 `ARKFLOW_HUB_TLS_KEY`(PEM 文件路径),Hub 即以 TLS 承载全部请求——路由、认证与 readiness 语义不变。只配置其一会拒绝启动。要启用 **mTLS**,可同时配置 `ARKFLOW_HUB_TLS_CA`(受信任 CA 证书链)与可选的 `ARKFLOW_HUB_TLS_CLIENT_AUTH`:
 
-**数据面(跨节点 shuffle)。**同时设置 `ARKFLOW_DATA_PLANE_TLS_CERT`、`ARKFLOW_DATA_PLANE_TLS_KEY`、`ARKFLOW_DATA_PLANE_TLS_CA`(节点证书、私钥、舰队 CA)后,所有跨节点连接运行 mTLS:任何帧(包括 HMAC 会话握手)交换之前,双方都必须出示锚定舰队 CA 的证书。节点证书须含 SAN `DNS:arkflow-data-plane`(固定校验名;节点身份仍由 HMAC 握手证明)。部分配置会被忽略并告警。生成舰队 CA 与节点证书的 openssl 示例:
+| 变量 | 默认值 | 说明 |
+| --- | --- | --- |
+| `ARKFLOW_HUB_TLS_CA` | 未设置 | 用于校验 Hub 监听器客户端证书的 PEM CA 证书包。 |
+| `ARKFLOW_HUB_TLS_CLIENT_AUTH` | 配置了 CA 时为 `agent_required` | `agent_required` 仅在 `/api/v1/agent/*` 上强制校验客户端证书,保留 `/health`、`/readiness`、`/liveness` 与操作员/Console 路由在 TLS 上可达;`required` 对所有端点强制客户端证书;`none` 关闭客户端证书校验。未配置 `ARKFLOW_HUB_TLS_CA` 或服务端证书时设置非 `none` 模式会在启动期 fail-closed 失败。 |
+
+Agent 侧可设置 `ARKFLOW_AGENT_TLS_CA`(或 `health_check.tls_ca`)信任 Hub CA,并成对设置 `ARKFLOW_AGENT_TLS_CERT` + `ARKFLOW_AGENT_TLS_KEY`(只设置其一会拒绝启动)在调用 `/api/v1/agent/*` 时出示客户端证书。若对等证书携带 `URI:urn:arkflow:node:<node_id>` SAN,Hub 会把 `/api/v1/agent/*` 请求严格绑定到 `<node_id>`(不匹配返回 `401`);未携带 `urn:arkflow:node:` SAN 的证书仍可通过 CA 校验 + 节点凭据认证。
+
+**数据面(跨节点 shuffle)。**同时设置 `ARKFLOW_DATA_PLANE_TLS_CERT`、`ARKFLOW_DATA_PLANE_TLS_KEY`、`ARKFLOW_DATA_PLANE_TLS_CA`(节点证书、私钥、舰队 CA)后,所有跨节点连接运行 mTLS:任何帧(包括 HMAC 会话握手)交换之前,双方都必须出示锚定舰队 CA 的证书。节点证书须含 SAN `DNS:arkflow-data-plane`,并可附加 `URI:urn:arkflow:node:<node_id>` 将传输层证书绑定到预期源/目标节点 ID(未带 `urn:arkflow:node:` SAN 时保持兼容)。部分配置会被忽略并告警。生成舰队 CA、Hub 与节点证书的 openssl 示例:
 
 ```bash
 # 舰队 CA
 openssl req -x509 -newkey rsa:2048 -nodes -keyout ca.key -out ca.pem \
   -subj "/CN=arkflow-fleet-ca" -days 3650
-# 每节点(逐计算节点重复)
+# Hub 服务端证书
+openssl req -newkey rsa:2048 -nodes -keyout hub.key -out hub.csr \
+  -subj "/CN=arkflow-hub"
+openssl x509 -req -in hub.csr -CA ca.pem -CAkey ca.key -out hub.pem \
+  -days 365 -extfile <(echo "subjectAltName=DNS:arkflow-hub,DNS:localhost,IP:127.0.0.1")
+# 每节点(逐计算节点重复;如需严格 SAN 身份绑定请附加 URI:urn:arkflow:node:<node_id>)
 openssl req -newkey rsa:2048 -nodes -keyout node.key -out node.csr \
   -subj "/CN=arkflow-node"
 openssl x509 -req -in node.csr -CA ca.pem -CAkey ca.key -out node.pem \
-  -days 365 -extfile <(echo "subjectAltName=DNS:arkflow-data-plane")
+  -days 365 -extfile <(echo "subjectAltName=DNS:arkflow-data-plane,URI:urn:arkflow:node:node-a")
 ```
 
 请在全部计算节点上启用 TLS 后再依赖 split 放置:滚动启用期间明文与 TLS 节点互连失败(连接 fail-closed)。证书轮换意味着重启进程(自动续期不在范围内)。
 
+### 节点身份与逐节点凭据
+
+在持久化 Hub(SQLite 或 PostgreSQL,schema v7 `cp_node_credentials`)上,每个计算节点使用**逐节点不透明凭据**(`arkn_<credential_id>_<secret>`)认证,存储层仅保存 `SHA-256(credential_id ‖ 0x00 ‖ secret)` 哈希并采用常量时间比较。每条逐节点凭据严格绑定到单个 `node_id`——拿 node-a 的凭据以 `node-b` 注册会被 `401` 拒绝,并在 `"node"` 分类下写入 `node_identity_mismatch` 审计事件。
+
+支持两种准入路径:
+
+1. **Bootstrap 准入(默认零接触接入):**尚无活跃逐节点凭据的节点首次持共享 `node_token` 注册时,Hub 签发一条 `"bootstrap"` 凭据并通过 `RegisterResponse.node_credential` 仅返回一次。Agent 在内存中保留该凭据用于后续重连,若设置了 `ARKFLOW_NODE_CREDENTIAL_FILE`(或 `health_check.node_credential_file`)还会以 `0600` 原子写入磁盘跨重启保留。一旦某个 `node_id` 已持有活跃的逐节点凭据,继续持共享 `node_token` 注册该 `node_id` 会被拒绝(`401`,审计原因 `bootstrap_blocked_enrolled_node`)。
+2. **预置与全生命周期管理(零 bootstrap 模式):**拥有 `ManageNodes` 权限的操作员可通过 `POST /api/v1/nodes/{node_id}/credentials` 预签发逐节点凭据、通过 `POST /api/v1/node-credentials/{credential_id}/rotate` 轮换,并通过 `DELETE /api/v1/node-credentials/{credential_id}` 吊销(吊销与轮换会立即令对应活跃会话失效)。单节点最多 8 条活跃凭据。
+
+Hub 控制面 bootstrap/应急开关:
+
+| 变量 | 默认值 | 说明 |
+| --- | --- | --- |
+| `ARKFLOW_HUB_NODE_BOOTSTRAP_DISABLED` | `false` | 设为 `true` 完全禁止共享 `node_token` bootstrap 准入;所有节点必须出示预签发的 `arkn_*` 凭据。 |
+| `ARKFLOW_ALLOW_SHARED_NODE_TOKEN_BREAK_GLASS` | `false` | 应急恢复开关:允许已接入节点临时继续使用共享 `node_token` 重新注册(会落审计)。日常运维请保持 `false`。 |
+
 ### 数据面认证与秘密
 
-跨节点 shuffle 帧在应用层独立于 TLS 认证(线协议 v2):会话握手双向交换新鲜 nonce,并由共享秘密派生每连接、每方向的会话密钥;此后每一帧(数据、信号、回执)都携带截断 HMAC tag,覆盖其帧头、负载与连接级单调序号,并在任何负载解析之前验证。伪造、篡改或重放的帧一律以确定性协议错误 fail-closed。mTLS(上文)仍是机密性的 opt-in 层;帧认证始终开启。
+跨节点 shuffle 帧在应用层独立于 TLS 认证(线协议 v2):会话握手双向交换新鲜 nonce,并派生每连接、每方向的会话密钥;此后每一帧(数据、信号、回执)都携带截断 HMAC tag,覆盖其帧头、负载与连接级单调序号,并在任何负载解析之前验证。伪造、篡改或重放的帧一律以确定性协议错误 fail-closed。
 
-**秘密配置(BREAKING)。**共享秘密只来自 `ARKFLOW_DATA_PLANE_SECRET`。此前回退到舰队共享 `node_token` 的行为已移除:泄露的注册令牌不再同时泄露 shuffle 秘密。未显式配置秘密的节点以 colocated-only 运行(启动告警,不监听数据面端口)。请为每个参与 shuffle 的节点设置同一秘密。该值**按字面使用**——`${secret:...}`/`${env:...}` 引用只在配置文件中解析,对此环境变量不生效。注意这**不**构成如下信任边界:每个参与 Agent 都持有同一 shuffle 秘密,被攻陷的 shuffle Agent 依然持有它——一旦怀疑泄露,轮换共享秘密(所有 Agent 以新值重启)。
+**Hub 下发逐边秘密与 mTLS。**对 `split` 作业,Hub 按有向节点对 `(src_node, dst_node)` 与 `(job_id, generation)` 缓存 32 字节随机秘密,并在 `job_start.payload.edge_secrets` 中**只向每个节点下发与其相连的边秘密**(作业停止或代数递增时立即驱逐)。入站握手在消耗重放 nonce 前先以匹配的逐边秘密验签 MAC,避免同一作业内无关节点伪造边流量。启用了数据面 mTLS(`ARKFLOW_DATA_PLANE_TLS_*`)的 Agent 会自动进入 `hub_provisioned` 模式,无需再配置全舰队共享 `ARKFLOW_DATA_PLANE_SECRET`(既无 mTLS 也无 `ARKFLOW_DATA_PLANE_SECRET` 的节点保持仅 colocated 降级并打启动告警)。`ARKFLOW_DATA_PLANE_SECRET` 仍作为静态共享密钥的兼容回退保留(注意:仅依赖该共享密钥时所有参与节点持有相同密钥材料);其值**按字面使用**,不解析 `${secret:...}` / `${env:...}` 引用。
 
-**升级窗口。**v2 线格式与 v1 不互通:混合版本舰队的数据面握手 fail-closed。请先停止分布式 Job,同窗口升级全部 Agent 后再重启。若此前依赖 `node_token` 回退,升级前先在每个节点配置 `ARKFLOW_DATA_PLANE_SECRET`。
+**升级窗口。**v2 线格式与 v1 不互通:混合版本舰队的数据面握手 fail-closed。请先停止分布式 Job,同窗口升级 Hub 与全部 Agent 后再重启。
 
 **可选调优**——全部变量可选;缺省即默认值:
 

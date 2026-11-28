@@ -93,3 +93,23 @@ defaults ON (SQLite durability) unless Postgres or an explicit opt-out. */}}
 {{- .Values.persistence.enabled }}
 {{- end -}}
 {{- end }}
+
+{{/* True when control-plane mode renders Hub/Agent mTLS. */}}
+{{- define "arkflow.cpTlsEnabled" -}}
+{{- if and (eq .Values.mode "control-plane") .Values.controlPlane.tls.enabled }}true{{- end }}
+{{- end }}
+
+{{/* Secret holding CA + Hub/Agent mTLS certificates in control-plane mode. */}}
+{{- define "arkflow.cpTlsSecretName" -}}
+{{- if .Values.controlPlane.tls.existingSecret }}{{ .Values.controlPlane.tls.existingSecret }}{{- else }}{{ include "arkflow.fullname" . }}-tls{{- end }}
+{{- end }}
+
+{{/* True when the engine agent mounts Hub + data-plane mTLS certificates. */}}
+{{- define "arkflow.agentTlsEnabled" -}}
+{{- if or (and (eq .Values.mode "control-plane") .Values.controlPlane.tls.enabled) (and (eq .Values.mode "agent") .Values.agent.tls.existingSecret) }}true{{- end }}
+{{- end }}
+
+{{/* Secret holding Agent CA/cert/key (shared chart Secret in control-plane mode, or user existingSecret in agent mode). */}}
+{{- define "arkflow.agentTlsSecretName" -}}
+{{- if eq .Values.mode "control-plane" }}{{ include "arkflow.cpTlsSecretName" . }}{{- else }}{{ .Values.agent.tls.existingSecret }}{{- end }}
+{{- end }}
