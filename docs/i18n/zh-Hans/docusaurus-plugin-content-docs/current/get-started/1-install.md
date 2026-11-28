@@ -40,6 +40,7 @@ cargo test
 | `connectors-mqtt` | `mqtt` 输入/输出 |
 | `connectors-nats` | `nats` 输入/输出 |
 | `connectors-amqp09` | `amqp09`（RabbitMQ）输入/输出 |
+| `connectors-iceberg` | `iceberg`（Apache Iceberg）输出 |
 | `connectors-redis` | `redis` 输入/输出/temporary |
 | `connectors-websocket` | `websocket` 输入 |
 | `connectors-modbus` | `modbus` 输入 |

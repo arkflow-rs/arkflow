@@ -100,6 +100,12 @@ object_store = { version = "0.13", features = ["aws", "azure", "gcp", "http"] }
 bytes = "1"
 hdfs-native-object-store = { version = "0.16", optional = true }
 
+# Iceberg output (connectors-iceberg)
+iceberg = { workspace = true, optional = true }
+iceberg-catalog-rest = { workspace = true, optional = true }
+iceberg-storage-opendal = { workspace = true, optional = true }
+reqsign-core = { workspace = true, optional = true }
+
 # Compression (WAL segment optimization)
 zstd = "0.13"
 lz4_flex = "0.14"
@@ -112,6 +118,12 @@ futures = { workspace = true }
 tokio-stream = "0.1.18"
 url = "2.5.8"
 num_cpus = "1.17.0"
+
+arrow-select = { workspace = true }
+arrow-cast = { workspace = true }
+arrow-schema = "58.4"
+arrow-buffer = "58.4"
+parquet = { version = "58.4", features = ["arrow"], optional = true }
 
 # Feature gating: default enables every family so a default build registers
 # exactly the same components as an ungated build. Use
@@ -128,6 +140,7 @@ default = [
     "connectors-mqtt",
     "connectors-nats",
     "connectors-amqp09",
+    "connectors-iceberg",
     "connectors-redis",
     "connectors-websocket",
     "connectors-modbus",
@@ -153,6 +166,8 @@ connectors-mqtt = ["dep:rumqttc"]
 connectors-nats = ["dep:async-nats"]
 # RabbitMQ (AMQP 0.9/0.9.1) input/output
 connectors-amqp09 = ["dep:lapin"]
+# Iceberg lakehouse output: iceberg core + REST catalog + OpenDAL storage
+connectors-iceberg = ["dep:iceberg", "dep:iceberg-catalog-rest", "dep:iceberg-storage-opendal", "dep:reqsign-core", "dep:parquet"]
 # Redis input/output/temporary
 connectors-redis = ["dep:redis"]
 # WebSocket input
@@ -169,6 +184,12 @@ codecs-protobuf = ["dep:prost-reflect", "dep:prost-types", "dep:protox"]
 # Minimal build meta-feature: core engine + light components only.
 # Only meaningful together with --no-default-features (features are additive).
 engine-minimal = []
+
+# The gated integration tests import the optional iceberg crates directly.
+[[test]]
+name = "iceberg_output"
+path = "tests/iceberg_output.rs"
+required-features = ["connectors-iceberg"]
 
 [dev-dependencies]
 # tokio's "full" does not include "test-util"; the default build got it

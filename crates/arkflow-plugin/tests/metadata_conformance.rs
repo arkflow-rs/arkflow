@@ -122,6 +122,12 @@ const CONFIG_TYPES: &[(&str, &str, &str, &str)] = &[
     ("output", "http", "output/http.rs", "HttpOutputConfig"),
     (
         "output",
+        "iceberg",
+        "output/iceberg.rs",
+        "IcebergOutputConfig",
+    ),
+    (
+        "output",
         "influxdb",
         "output/influxdb.rs",
         "InfluxDBOutputConfig",

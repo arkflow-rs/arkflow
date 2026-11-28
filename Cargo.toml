@@ -98,6 +98,17 @@ mockall = "0.15"
 redb = "5"
 object_store = { version = "0.13", features = ["aws", "azure", "gcp", "http"] }
 bytes = "1"
+# Iceberg lakehouse sink (connectors-iceberg): core + REST catalog + OpenDAL-backed storage
+iceberg = { version = "0.11", default-features = false }
+reqsign-core = "3"
+arrow-select = "58.4"
+arrow-cast = "58.4"
+iceberg-catalog-rest = { version = "0.11", default-features = false }
+iceberg-storage-opendal = { version = "0.11", default-features = false, features = [
+    "opendal-s3",
+    "opendal-fs",
+    "opendal-memory",
+] }
 arkflow-core = { path = "crates/arkflow-core", version = "0.6.0" }
 # default-features = false: member crates forward the family features
 # explicitly in their own [features].default (see crates/arkflow/Cargo.toml);

@@ -116,6 +116,17 @@ pub struct ComponentMetadata {
     /// hover / completion.
     #[serde(skip_serializing_if = "Option::is_none", default)]
     pub config_example: Option<serde_json::Value>,
+    /// Whether this component accepts the generic `codec` field. Outputs
+    /// that reject a configured codec at build time (they derive their
+    /// writing format from the target system) must declare `false`, so the
+    /// generated config schema does not advertise a field the builder
+    /// rejects. Defaults to `true`.
+    #[serde(default = "default_true")]
+    pub codec_supported: bool,
+}
+
+fn default_true() -> bool {
+    true
 }
 
 impl ComponentMetadata {
@@ -127,6 +138,7 @@ impl ComponentMetadata {
             config_optional: true,
             config_schema: serde_json::json!({"type": "object"}),
             config_example: None,
+            codec_supported: true,
         }
     }
 
@@ -142,7 +154,15 @@ impl ComponentMetadata {
             config_optional: false,
             config_schema: schema,
             config_example: None,
+            codec_supported: true,
         }
+    }
+
+    /// Declare that this component rejects the generic `codec` field, so
+    /// the generated config schema omits it (see [`Self::codec_supported`]).
+    pub fn without_codec(mut self) -> Self {
+        self.codec_supported = false;
+        self
     }
 
     /// Mark the configuration as optional (e.g. when the component provides
@@ -550,7 +570,10 @@ pub fn build_config_schema() -> serde_json::Value {
                 "properties": {
                     "type": {
                         "type": "string",
-                        "enum": variants.iter().map(|v| v["name"].clone()).collect::<Vec<_>>(),
+                        "enum": variants
+                            .iter()
+                            .map(|v| v["title"].clone())
+                            .collect::<Vec<_>>(),
                         "description": format!("{} component type.", kind)
                     },
                     "name": {
@@ -950,7 +973,9 @@ fn variant_schemas(kind: ComponentKind) -> serde_json::Value {
             let mut properties = serde_json::Map::new();
             properties.insert("type".to_string(), props["type"].clone());
             properties.insert("name".to_string(), props["name"].clone());
-            properties.insert("codec".to_string(), codec_schema());
+            if m.codec_supported {
+                properties.insert("codec".to_string(), codec_schema());
+            }
             // The component-specific config keys are flattened into the
             // top-level object, so we splice them in via a pattern of
             // additionalProperties alongside an optional embedded schema.

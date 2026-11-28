@@ -55,6 +55,7 @@ const BOUNDED_EOF_INPUT: &[&str] = &[
 const OUTPUT_DISCONNECTION_ALLOW: &[&str] = &[
     "amqp09.rs",
     "codec_helper.rs",
+    "iceberg.rs",
     "nats.rs",
     "pgvector.rs",
     "redis.rs",
@@ -246,6 +247,22 @@ async fn nats_output_write_before_connect_is_connection_error() {
             "url": "nats://127.0.0.1:1",
             "mode": {"type": "regular", "subject": {"type": "value", "value": "s"}},
             "value_field": null,
+        }),
+    )
+    .await;
+    assert!(matches!(err, Error::Connection(_)), "{err:?}");
+}
+
+#[tokio::test]
+async fn iceberg_output_write_before_connect_is_connection_error() {
+    let err = guard_error(
+        "iceberg",
+        serde_json::json!({
+            "catalog": {"uri": "http://127.0.0.1:1/catalog", "warehouse": "demo"},
+            "namespace": "analytics",
+            "table": "events",
+            "exactly_once": false,
+            "writer_id": null,
         }),
     )
     .await;

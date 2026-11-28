@@ -35,6 +35,7 @@ This page is generated from [`component-inventory.json`](../../reference/compone
 | output | `amqp09` | Publishes messages to an AMQP 0.9/0.9.1 exchange (such as RabbitMQ). | [reference](../components/outputs/amqp09) |
 | output | `drop` | Discards all messages. Useful for performance benchmarks and dead-end pipelines. | [reference](../components/outputs/drop) |
 | output | `http` | Posts each batch to an HTTP endpoint. Supports custom headers, retry, and auth. | [reference](../components/outputs/http) |
+| output | `iceberg` | Appends rows to an existing Apache Iceberg table through a REST catalog. One write_batch call is one atomic table append; a batch processor in front of this output controls commit cadence and file size. | [reference](../components/outputs/iceberg) |
 | output | `influxdb` | Writes time-series data to InfluxDB v2.x using the Line Protocol. | [reference](../components/outputs/influxdb) |
 | output | `kafka` | Produces messages to Apache Kafka. Supports key-based partitioning and compression. | [reference](../components/outputs/kafka) |
 | output | `milvus` | Upserts batch rows into a Milvus collection over the REST v2 vectordb API: a Float32 list column becomes the vector, other columns pack into a JSON payload field, and an optional id column keys the row. | [reference](../components/outputs/milvus) |
