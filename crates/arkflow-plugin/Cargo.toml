@@ -45,7 +45,7 @@ reqwest = { workspace = true }
 percent-encoding = { workspace = true }
 tower = "0.5"
 tower-http = { version = "0.7.0", features = ["cors", "trace"] }
-base64 = "0.22"
+base64 = "0.23"
 subtle = { workspace = true }
 flume = { workspace = true }
 dashmap = { workspace = true }
