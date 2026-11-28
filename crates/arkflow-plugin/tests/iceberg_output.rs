@@ -520,6 +520,83 @@ async fn missing_required_column_fails_closed() {
 }
 
 #[tokio::test]
+async fn all_void_partition_spec_fails_at_connect() {
+    gated!({
+        let name = format!("t_void_{}", std::process::id());
+        let catalog = catalog().await;
+        let arrow = ArrowSchema::new(vec![
+            Arc::new(ArrowField::new("id", DataType::Int64, false)),
+            Arc::new(ArrowField::new("event_type", DataType::Utf8, false)),
+        ]);
+        let schema =
+            iceberg::arrow::arrow_schema_to_schema_auto_assign_ids(&arrow).expect("schema");
+        let partition_spec = UnboundPartitionSpec::builder()
+            .add_partition_field(1, "id_void", iceberg::spec::Transform::Void)
+            .expect("add field")
+            .build();
+        let creation = TableCreation::builder()
+            .name(name.clone())
+            .schema(schema)
+            .partition_spec(partition_spec)
+            .build();
+        catalog
+            .create_table(&namespace_ident(), creation)
+            .await
+            .expect("create all-void table");
+
+        let config = output_config(&name, false);
+        let output = config.build(&resource()).expect("build");
+        let created = catalog
+            .load_table(&TableIdent::new(namespace_ident(), name.clone()))
+            .await
+            .expect("load all-void table");
+        let spec_id = created.metadata().default_partition_spec().spec_id();
+        if spec_id == 0 {
+            // This catalog normalized the all-void spec away; the rejection
+            // logic itself is pinned by the unit test
+            // `all_void_non_default_spec_is_rejected`.
+            eprintln!("catalog normalized the all-void spec to id 0; nothing to assert");
+            return;
+        }
+        let error = output
+            .connect()
+            .await
+            .expect_err("all-void spec must fail at connect");
+        assert!(
+            error.to_string().contains("all-void"),
+            "error must name the all-void spec: {error}"
+        );
+    });
+}
+
+#[tokio::test]
+async fn same_instance_writes_twice_on_one_commit_cache() {
+    // Regression for the committed-table cache: the Table returned by
+    // `commit()` lacks the per-table storage properties that the loadTable
+    // response carries (including the s3.* overrides this test sends), so
+    // caching it after the first commit would break the SECOND write's
+    // upload. The output must keep using the loaded Table.
+    gated!({
+        let name = format!("t_twice_{}", std::process::id());
+        let table = create_table(&name).await;
+        let config = output_config(&name, true);
+        let output = config.build(&resource()).expect("build");
+        output.connect().await.expect("connect");
+        output
+            .write_batch(&[message(rows_batch(0, 10, true))])
+            .await
+            .expect("first write");
+        output
+            .write_batch(&[message(rows_batch(10, 10, true))])
+            .await
+            .expect("second write on the same instance");
+        let reloaded = reload(&table, &name).await;
+        assert_eq!(scan_rows(&reloaded).await, 20);
+        output.close().await.expect("close");
+    });
+}
+
+#[tokio::test]
 async fn rows_route_under_partition_values() {
     gated!({
         let name = format!("t_part_{}", std::process::id());

@@ -856,7 +856,8 @@ pub fn init() -> Result<(), Error> {
         "table_name": "events",
         "upsert": true,
         "upsert_keys": ["id"]
-    })))
+    }))
+        .without_codec())
 }
 
 #[cfg(test)]

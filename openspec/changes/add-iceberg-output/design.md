@@ -57,7 +57,7 @@ Kafka ─▶ MessageBatch (rows carry __meta_partition / __meta_offset / __meta_
             └─Ok─▶ kernel settles acks ─▶ WAL cursor advances + Kafka offsets commit
 ```
 
-Every input batch of the call is concatenated, encoded, uploaded, and committed with a single fast-append snapshot. `Ok` is returned only after the catalog accepts the commit. The output holds no row, open file, or timer between calls, so `close()` has nothing to flush and a crash before `Ok` leaves nothing acknowledged.
+Every input batch of the call is concatenated, encoded, uploaded, and committed with a single fast-append snapshot. `Ok` is returned only after the catalog accepts the commit. A call that carries no rows, or whose rows are all filtered as already committed, returns `Ok` without creating a snapshot — exactly one append per call with new rows, zero appends otherwise. The output holds no row, open file, or timer between calls, so `close()` has nothing to flush and a crash before `Ok` leaves nothing acknowledged.
 
 Alternatives considered:
 

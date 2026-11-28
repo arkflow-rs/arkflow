@@ -263,15 +263,13 @@ impl IcebergOutputConfig {
     }
 
     fn namespace_ident(&self) -> Result<NamespaceIdent, Error> {
-        let parts: Vec<&str> = self
-            .namespace
-            .split('.')
-            .map(str::trim)
-            .filter(|part| !part.is_empty())
-            .collect();
-        if parts.is_empty() {
+        let parts: Vec<&str> = self.namespace.split('.').map(str::trim).collect();
+        // Empty segments must fail the build: silently collapsing
+        // `analytics..eu` into `analytics.eu` could append to an unrelated
+        // table instead of reporting the typo.
+        if parts.is_empty() || parts.iter().any(|part| part.is_empty()) {
             return Err(Error::Config(format!(
-                "iceberg output: invalid namespace {:?}",
+                "iceberg output: invalid namespace {:?} — empty segments are not allowed",
                 self.namespace
             )));
         }
@@ -358,6 +356,7 @@ pub fn init() -> Result<(), Error> {
                 "required": ["catalog", "namespace", "table"]
             }),
         )
+        .without_codec()
         .with_example(serde_json::json!({
             "catalog": {"uri": "http://lakekeeper:8181/catalog", "warehouse": "demo"},
             "namespace": "analytics",
@@ -517,6 +516,14 @@ impl IcebergOutput {
             }
             current = snapshot.parent_snapshot_id();
         }
+        // The ancestry ended without a match: same degradation as exhausting
+        // the lookback — say so instead of starting silently.
+        warn!(
+            writer_id,
+            visited,
+            "iceberg output: no snapshot in the ancestry carries this writer's watermark; \
+             starting without one — replayed rows may be duplicated"
+        );
         None
     }
 }
@@ -542,22 +549,11 @@ impl IcebergOutput {
             }
         })?;
 
-        // Reject a partition spec this output cannot evaluate before the
-        // first write — never fall back to writing as if unpartitioned.
-        let spec = table.metadata().default_partition_spec();
-        if !spec.is_unpartitioned() {
-            iceberg::arrow::partition_value_calculator::PartitionValueCalculator::try_new(
-                spec,
-                table.metadata().current_schema(),
-            )
-            .map_err(|error| {
-                Error::Process(format!(
-                    "iceberg output: table {} has a partition spec this output cannot \
-                     evaluate: {error}",
-                    self.config.table
-                ))
-            })?;
-        }
+        ensure_table_shape_supported(
+            &self.config.table,
+            table.metadata().current_schema(),
+            table.metadata().default_partition_spec(),
+        )?;
 
         let watermark = if self.config.exactly_once {
             let writer_id = self.config.writer_id.as_deref().expect("validated");
@@ -587,17 +583,26 @@ impl IcebergOutput {
     }
 }
 
-/// The table's `write.parquet.compression-codec` (parquet default snappy).
-fn table_compression(properties: &HashMap<String, String>) -> ParquetCompressionCodec {
+/// The table's `write.parquet.compression-codec`. An explicit value the
+/// output cannot honor must fail rather than silently fall back to snappy.
+fn table_compression(
+    properties: &HashMap<String, String>,
+) -> Result<ParquetCompressionCodec, Error> {
     match properties
         .get("write.parquet.compression-codec")
         .map(|value| value.to_lowercase())
         .as_deref()
     {
-        Some("gzip") => ParquetCompressionCodec::GZIP(arrow_variant_gzip_level()),
-        Some("zstd") => ParquetCompressionCodec::ZSTD(arrow_variant_zstd_level()),
-        Some("lz4") => ParquetCompressionCodec::LZ4_RAW,
-        _ => ParquetCompressionCodec::SNAPPY,
+        None | Some("snappy") => Ok(ParquetCompressionCodec::SNAPPY),
+        Some("gzip") => Ok(ParquetCompressionCodec::GZIP(arrow_variant_gzip_level())),
+        Some("zstd") => Ok(ParquetCompressionCodec::ZSTD(arrow_variant_zstd_level())),
+        Some("lz4") => Ok(ParquetCompressionCodec::LZ4_RAW),
+        Some("uncompressed") | Some("none") => Ok(ParquetCompressionCodec::UNCOMPRESSED),
+        Some(other) => Err(Error::Process(format!(
+            "iceberg output: table compression codec {other:?} is not supported by this \
+             output — set write.compression in the output config or change the table \
+             property"
+        ))),
     }
 }
 
@@ -607,6 +612,46 @@ fn table_target_file_size(properties: &HashMap<String, String>) -> usize {
         .get("write.target-file-size-bytes")
         .and_then(|value| value.parse().ok())
         .unwrap_or(512 * 1024 * 1024)
+}
+
+/// Up-front table-shape rejection, run at `connect()`: reserved `__meta_*`
+/// columns must never reach the data files, and a partition spec the output
+/// cannot evaluate (or an all-void non-default spec, whose rows would be
+/// written under a spec-id mismatch) must fail before the first write.
+fn ensure_table_shape_supported(
+    table: &str,
+    schema: &iceberg::spec::Schema,
+    spec: &iceberg::spec::PartitionSpec,
+) -> Result<(), Error> {
+    for field in schema.as_struct().fields() {
+        if field.name.starts_with("__meta_") {
+            return Err(Error::Process(format!(
+                "iceberg output: table {table} declares reserved metadata column {:?} — \
+                 __meta_* columns are never written by this output",
+                field.name
+            )));
+        }
+    }
+    // An all-void spec reports is_unpartitioned() == true but keeps its own
+    // spec id — writing it with a null partition key produces a spec-id
+    // mismatch the catalog rejects, so refuse it up front.
+    if spec.is_unpartitioned() && spec.spec_id() != 0 {
+        return Err(Error::Process(format!(
+            "iceberg output: table {table} uses an all-void partition spec (id {}) — drop \
+             the spec or repartition with a supported transform",
+            spec.spec_id()
+        )));
+    }
+    if !spec.is_unpartitioned() {
+        iceberg::arrow::partition_value_calculator::PartitionValueCalculator::try_new(spec, schema)
+            .map_err(|error| {
+                Error::Process(format!(
+                    "iceberg output: table {table} has a partition spec this output cannot \
+                 evaluate: {error}"
+                ))
+            })?;
+    }
+    Ok(())
 }
 
 /// Transient transport failures surface as the bare `Error::Disconnection`
@@ -715,8 +760,18 @@ fn extract_positions(batch: &RecordBatch) -> Result<PositionColumns, Error> {
                 structs.column_by_name("key"),
                 structs.column_by_name("value"),
             ) {
-                let keys = keys.as_string::<i32>();
-                let values = values.as_string::<i32>();
+                // Fallible downcasts: a map with non-string entries must
+                // fail with a named column, not panic.
+                let (Some(keys), Some(values)) = (
+                    keys.as_any().downcast_ref::<arrow_array::StringArray>(),
+                    values.as_any().downcast_ref::<arrow_array::StringArray>(),
+                ) else {
+                    return Err(Error::Process(format!(
+                        "iceberg output: {} map entries have non-string types — the topic \
+                         key must be a string",
+                        arkflow_core::meta_columns::EXT
+                    )));
+                };
                 for entry in 0..keys.len() {
                     if !keys.is_null(entry) && keys.value(entry) == "topic" {
                         if !values.is_null(entry) {
@@ -890,9 +945,10 @@ fn is_lossless_cast(from: &DataType, to: &DataType) -> bool {
         // Float widening.
         (Float16, Float32 | Float64) => true,
         (Float32, Float64) => true,
-        // Timestamps: widening units only, timezone-ness must match.
+        // Timestamps: widening units only; the timezone annotation must be
+        // equivalent (Iceberg spells UTC as `+00:00`).
         (Timestamp(from_unit, from_tz), Timestamp(to_unit, to_tz)) => {
-            from_tz == to_tz && unit_rank(from_unit) <= unit_rank(to_unit)
+            timezone_equivalent(from_tz, to_tz) && unit_rank(from_unit) <= unit_rank(to_unit)
         }
         (Date32, Date64) => true,
         (Time32(from_unit), Time64(to_unit)) => unit_rank(from_unit) <= unit_rank(to_unit),
@@ -901,6 +957,20 @@ fn is_lossless_cast(from: &DataType, to: &DataType) -> bool {
         (Binary, LargeBinary) => true,
         _ => false,
     }
+}
+
+/// Iceberg projects `timestamptz` with `+00:00`; the same instant spelled
+/// `UTC` must compare equal — the annotation is metadata over the same
+/// underlying values.
+fn timezone_equivalent(a: &Option<Arc<str>>, b: &Option<Arc<str>>) -> bool {
+    fn canonical(tz: &Option<Arc<str>>) -> Option<String> {
+        tz.as_deref()
+            .map(|value| match value.to_ascii_uppercase().as_str() {
+                "UTC" | "+00:00" | "+00" | "Z" | "+00:00:00" => "+00:00".to_string(),
+                other => other.to_string(),
+            })
+    }
+    canonical(a) == canonical(b)
 }
 
 fn unit_rank(unit: &TimeUnit) -> u8 {
@@ -1040,17 +1110,18 @@ impl IcebergOutput {
         Ok(state)
     }
 
-    async fn persist_state(
-        &self,
-        catalog: Arc<RestCatalog>,
-        table: Table,
-        watermark: Option<Watermark>,
-    ) {
-        *self.inner.lock().await = Some(Connected {
-            catalog,
-            table,
-            watermark,
-        });
+    /// Record the new watermark after a successful commit. The loaded Table
+    /// is deliberately kept: the Table returned by `commit()` is constructed
+    /// without the per-table storage properties from the loadTable response,
+    /// so caching it would send the next upload to a FileIO without the S3
+    /// endpoint. The stale metadata is harmless — the transaction rebases on
+    /// the catalog's current state, and the watermark is state this output
+    /// owns.
+    async fn persist_watermark(&self, watermark: Option<Watermark>) {
+        let mut inner = self.inner.lock().await;
+        if let Some(connected) = inner.as_mut() {
+            connected.watermark = watermark;
+        }
     }
 
     /// Warning contract: ten commits inside two seconds means the pipeline is
@@ -1143,7 +1214,8 @@ impl IcebergOutput {
                     .write
                     .compression
                     .map(ParquetCompressionCodec::from)
-                    .unwrap_or_else(|| table_compression(table.metadata().properties()));
+                    .map(Ok)
+                    .unwrap_or_else(|| table_compression(table.metadata().properties()))?;
                 let parquet_builder = ParquetWriterBuilder::new(
                     WriterProperties::builder().set_compression(codec).build(),
                     iceberg_schema.clone(),
@@ -1181,10 +1253,20 @@ impl IcebergOutput {
                     .build(partition_key)
                     .await
                     .map_err(|error| transient_error("opening a data file", error))?;
-                writer
-                    .write(part)
-                    .await
-                    .map_err(|error| transient_error("writing rows to a data file", error))?;
+                // The rolling writer checks the file size between writes and a
+                // fresh Parquet writer reports zero bytes — one giant write
+                // would never roll. Feed bounded row slices so the target
+                // file size is honored within a commit.
+                let row_bytes = part.get_array_memory_size() / part.num_rows().max(1);
+                let chunk_rows = (target_size / row_bytes.max(1)).clamp(1, part.num_rows());
+                for chunk_start in (0..part.num_rows()).step_by(chunk_rows) {
+                    let chunk_end = (chunk_start + chunk_rows).min(part.num_rows());
+                    let slice = part.slice(chunk_start, chunk_end - chunk_start);
+                    writer
+                        .write(slice)
+                        .await
+                        .map_err(|error| transient_error("writing rows to a data file", error))?;
+                }
                 let files = writer
                     .close()
                     .await
@@ -1334,17 +1416,21 @@ impl IcebergOutput {
                 })?;
             match transaction.commit(state.catalog.as_ref()).await {
                 Ok(committed) => {
+                    debug!(
+                        snapshot = committed
+                            .metadata()
+                            .current_snapshot()
+                            .map(|snapshot| snapshot.snapshot_id()),
+                        rows = kept_rows,
+                        attempt,
+                        "iceberg output: committed one snapshot"
+                    );
                     let watermark = if self.config.exactly_once {
                         Some(merged)
                     } else {
                         None
                     };
-                    self.persist_state(state.catalog.clone(), committed, watermark)
-                        .await;
-                    debug!(
-                        rows = kept_rows,
-                        attempt, "iceberg output: committed one snapshot"
-                    );
+                    self.persist_watermark(watermark).await;
                     self.note_commit_and_warn();
                     return Ok(());
                 }
@@ -1390,8 +1476,13 @@ impl Output for IcebergOutput {
 }
 
 fn error_is_transient(error: &Error) -> bool {
-    let message = error.to_string();
-    is_transient(&message)
+    match error {
+        // The unit variant only ever comes from this file's classifiers
+        // (`transient_error` / `commit_error`) — its Display text is a bare
+        // "Connection lost", which the phrase list cannot match.
+        Error::Disconnection => true,
+        other => is_transient(&other.to_string()),
+    }
 }
 
 fn commit_error(error: iceberg::Error) -> Error {
@@ -1405,6 +1496,10 @@ fn commit_error(error: iceberg::Error) -> Error {
     } else if is_transient(&message)
         || message.contains("Commit Failed")
         || message.contains("Retries exceeded")
+        // iceberg-catalog-rest maps HTTP 500/502/504 commit responses to
+        // messages that explicitly say the outcome is unknown — exactly the
+        // ambiguous-commit window, so reconcile against table state first.
+        || message.contains("the commit state is unknown")
     {
         // Optimistic-concurrency conflicts and transport failures are retried
         // by the attempt loop against reloaded state.
@@ -1680,6 +1775,40 @@ mod tests {
         assert!(!is_transient("HTTP 400 Bad Request: schema mismatch"));
         assert!(!is_transient("column id cannot be converted"));
         assert!(!is_transient("table not found"));
+    }
+
+    #[test]
+    fn all_void_non_default_spec_is_rejected() {
+        let arrow = ArrowSchema::new(vec![ArrowField::new("id", DataType::Int64, false)]);
+        let schema =
+            iceberg::arrow::arrow_schema_to_schema_auto_assign_ids(&arrow).expect("schema");
+        let spec = iceberg::spec::PartitionSpecBuilder::new(Arc::new(schema.clone()))
+            .with_spec_id(7)
+            .add_partition_field("id", "id_void", iceberg::spec::Transform::Void)
+            .expect("add field")
+            .build()
+            .expect("bound spec");
+        let error = ensure_table_shape_supported("t", &schema, &spec).unwrap_err();
+        assert!(error.to_string().contains("all-void"), "{error}");
+        let default_spec = iceberg::spec::PartitionSpecBuilder::new(Arc::new(schema.clone()))
+            .build()
+            .expect("default spec");
+        assert!(ensure_table_shape_supported("t", &schema, &default_spec).is_ok());
+    }
+
+    #[test]
+    fn reserved_table_columns_are_rejected() {
+        let arrow = ArrowSchema::new(vec![
+            ArrowField::new("id", DataType::Int64, false),
+            ArrowField::new("__meta_offset", DataType::Int64, false),
+        ]);
+        let schema =
+            iceberg::arrow::arrow_schema_to_schema_auto_assign_ids(&arrow).expect("schema");
+        let spec = iceberg::spec::PartitionSpecBuilder::new(Arc::new(schema.clone()))
+            .build()
+            .expect("default spec");
+        let error = ensure_table_shape_supported("t", &schema, &spec).unwrap_err();
+        assert!(error.to_string().contains("__meta_offset"), "{error}");
     }
 
     #[test]

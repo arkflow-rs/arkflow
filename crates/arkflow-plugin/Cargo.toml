@@ -185,6 +185,12 @@ codecs-protobuf = ["dep:prost-reflect", "dep:prost-types", "dep:protox"]
 # Only meaningful together with --no-default-features (features are additive).
 engine-minimal = []
 
+# The gated integration tests import the optional iceberg crates directly.
+[[test]]
+name = "iceberg_output"
+path = "tests/iceberg_output.rs"
+required-features = ["connectors-iceberg"]
+
 [dev-dependencies]
 # tokio's "full" does not include "test-util"; the default build got it
 # transitively from a gated connector dependency, so reduced test builds

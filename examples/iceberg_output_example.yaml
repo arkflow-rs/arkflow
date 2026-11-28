@@ -60,6 +60,10 @@ streams:
           bucket: "arkflow-wal"
           region: "us-east-1"
           endpoint: "http://localhost:9000"
+          # Bare ${VAR} placeholders keep this example offline-validatable
+          # (${env:...} references would demand the variable at parse time).
+          # Substitute real credentials — or ${env:...} references — when
+          # running.
           access_key_id: "${AWS_ACCESS_KEY_ID}"
           secret_access_key: "${AWS_SECRET_ACCESS_KEY}"
           allow_http: true

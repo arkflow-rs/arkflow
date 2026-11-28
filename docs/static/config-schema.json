@@ -252,20 +252,20 @@
         "type": {
           "type": "string",
           "enum": [
-            null,
-            null,
-            null,
-            null,
-            null,
-            null,
-            null,
-            null,
-            null,
-            null,
-            null,
-            null,
-            null,
-            null
+            "amqp09",
+            "file",
+            "generate",
+            "http",
+            "kafka",
+            "memory",
+            "modbus",
+            "mqtt",
+            "multiple_inputs",
+            "nats",
+            "pulsar",
+            "redis",
+            "sql",
+            "websocket"
           ],
           "description": "input component type."
         },
@@ -3398,22 +3398,22 @@
         "type": {
           "type": "string",
           "enum": [
-            null,
-            null,
-            null,
-            null,
-            null,
-            null,
-            null,
-            null,
-            null,
-            null,
-            null,
-            null,
-            null,
-            null,
-            null,
-            null
+            "amqp09",
+            "drop",
+            "http",
+            "iceberg",
+            "influxdb",
+            "kafka",
+            "milvus",
+            "mongodb",
+            "mqtt",
+            "nats",
+            "pgvector",
+            "pulsar",
+            "qdrant",
+            "redis",
+            "sql",
+            "stdout"
           ],
           "description": "output component type."
         },
@@ -4096,152 +4096,6 @@
             "name": {
               "type": "string",
               "description": "Optional logical name for this instance."
-            },
-            "codec": {
-              "oneOf": [
-                {
-                  "type": "object",
-                  "title": "debezium_json",
-                  "description": "Decodes Debezium CDC Envelope JSON (before/after/op/source/ts_ms) into a columnar Arrow batch; attach to a Kafka input consuming a Debezium topic. CDC offset is the Kafka input's ack-gated offset.",
-                  "properties": {
-                    "type": {
-                      "type": "string",
-                      "const": "debezium_json"
-                    }
-                  },
-                  "required": [
-                    "type"
-                  ]
-                },
-                {
-                  "type": "object",
-                  "title": "json",
-                  "description": "Encodes/decodes Arrow RecordBatches as JSON byte payloads.",
-                  "properties": {
-                    "type": {
-                      "type": "string",
-                      "const": "json"
-                    },
-                    "on_error": {
-                      "type": "string",
-                      "enum": [
-                        "fail",
-                        "skip"
-                      ],
-                      "default": "fail",
-                      "description": "Decode-error policy: `fail` fails the batch (default), `skip` isolates bad messages with a warning and decodes the rest."
-                    }
-                  },
-                  "required": [
-                    "type"
-                  ]
-                },
-                {
-                  "type": "object",
-                  "title": "protobuf",
-                  "description": "Encodes/decodes Arrow RecordBatches using a Protobuf descriptor.",
-                  "properties": {
-                    "type": {
-                      "type": "string",
-                      "const": "protobuf"
-                    },
-                    "message_type": {
-                      "type": "string",
-                      "description": "Fully-qualified Protobuf message type name."
-                    },
-                    "proto_inputs": {
-                      "type": "array",
-                      "items": {
-                        "type": "string"
-                      },
-                      "description": "Paths to .proto files."
-                    },
-                    "proto_includes": {
-                      "type": "array",
-                      "items": {
-                        "type": "string"
-                      },
-                      "description": "Include paths for proto resolution."
-                    },
-                    "on_error": {
-                      "type": "string",
-                      "enum": [
-                        "fail",
-                        "skip"
-                      ],
-                      "default": "fail",
-                      "description": "Decode-error policy: `fail` fails the batch (default), `skip` isolates bad messages with a warning and decodes the rest."
-                    }
-                  },
-                  "required": [
-                    "type",
-                    "message_type",
-                    "proto_inputs"
-                  ]
-                },
-                {
-                  "type": "object",
-                  "title": "schema_registry",
-                  "description": "Decodes Confluent wire-format Protobuf and Avro messages by resolving the schema id from a Schema Registry, with an optional subject compatibility gate.",
-                  "properties": {
-                    "type": {
-                      "type": "string",
-                      "const": "schema_registry"
-                    },
-                    "registry_url": {
-                      "type": "string",
-                      "description": "Confluent Schema Registry base URL."
-                    },
-                    "message_type": {
-                      "type": "string",
-                      "description": "Fully-qualified Protobuf message type. Required for Protobuf schemas; omit for Avro."
-                    },
-                    "subject": {
-                      "type": "string",
-                      "description": "Registry subject for the compatibility gate."
-                    },
-                    "min_compatibility": {
-                      "type": "string",
-                      "enum": [
-                        "none",
-                        "backward",
-                        "forward",
-                        "full"
-                      ],
-                      "description": "Minimum subject compatibility level enforced on the first decoded message. Requires `subject`."
-                    },
-                    "auth": {
-                      "type": "object",
-                      "description": "Optional registry authentication.",
-                      "properties": {
-                        "type": {
-                          "type": "string",
-                          "enum": [
-                            "basic",
-                            "bearer"
-                          ]
-                        },
-                        "username": {
-                          "type": "string"
-                        },
-                        "password": {
-                          "type": "string"
-                        },
-                        "token": {
-                          "type": "string"
-                        }
-                      },
-                      "required": [
-                        "type"
-                      ]
-                    }
-                  },
-                  "required": [
-                    "type",
-                    "registry_url"
-                  ]
-                }
-              ]
             },
             "catalog": {
               "type": "object",
@@ -7125,152 +6979,6 @@
               "type": "string",
               "description": "Optional logical name for this instance."
             },
-            "codec": {
-              "oneOf": [
-                {
-                  "type": "object",
-                  "title": "debezium_json",
-                  "description": "Decodes Debezium CDC Envelope JSON (before/after/op/source/ts_ms) into a columnar Arrow batch; attach to a Kafka input consuming a Debezium topic. CDC offset is the Kafka input's ack-gated offset.",
-                  "properties": {
-                    "type": {
-                      "type": "string",
-                      "const": "debezium_json"
-                    }
-                  },
-                  "required": [
-                    "type"
-                  ]
-                },
-                {
-                  "type": "object",
-                  "title": "json",
-                  "description": "Encodes/decodes Arrow RecordBatches as JSON byte payloads.",
-                  "properties": {
-                    "type": {
-                      "type": "string",
-                      "const": "json"
-                    },
-                    "on_error": {
-                      "type": "string",
-                      "enum": [
-                        "fail",
-                        "skip"
-                      ],
-                      "default": "fail",
-                      "description": "Decode-error policy: `fail` fails the batch (default), `skip` isolates bad messages with a warning and decodes the rest."
-                    }
-                  },
-                  "required": [
-                    "type"
-                  ]
-                },
-                {
-                  "type": "object",
-                  "title": "protobuf",
-                  "description": "Encodes/decodes Arrow RecordBatches using a Protobuf descriptor.",
-                  "properties": {
-                    "type": {
-                      "type": "string",
-                      "const": "protobuf"
-                    },
-                    "message_type": {
-                      "type": "string",
-                      "description": "Fully-qualified Protobuf message type name."
-                    },
-                    "proto_inputs": {
-                      "type": "array",
-                      "items": {
-                        "type": "string"
-                      },
-                      "description": "Paths to .proto files."
-                    },
-                    "proto_includes": {
-                      "type": "array",
-                      "items": {
-                        "type": "string"
-                      },
-                      "description": "Include paths for proto resolution."
-                    },
-                    "on_error": {
-                      "type": "string",
-                      "enum": [
-                        "fail",
-                        "skip"
-                      ],
-                      "default": "fail",
-                      "description": "Decode-error policy: `fail` fails the batch (default), `skip` isolates bad messages with a warning and decodes the rest."
-                    }
-                  },
-                  "required": [
-                    "type",
-                    "message_type",
-                    "proto_inputs"
-                  ]
-                },
-                {
-                  "type": "object",
-                  "title": "schema_registry",
-                  "description": "Decodes Confluent wire-format Protobuf and Avro messages by resolving the schema id from a Schema Registry, with an optional subject compatibility gate.",
-                  "properties": {
-                    "type": {
-                      "type": "string",
-                      "const": "schema_registry"
-                    },
-                    "registry_url": {
-                      "type": "string",
-                      "description": "Confluent Schema Registry base URL."
-                    },
-                    "message_type": {
-                      "type": "string",
-                      "description": "Fully-qualified Protobuf message type. Required for Protobuf schemas; omit for Avro."
-                    },
-                    "subject": {
-                      "type": "string",
-                      "description": "Registry subject for the compatibility gate."
-                    },
-                    "min_compatibility": {
-                      "type": "string",
-                      "enum": [
-                        "none",
-                        "backward",
-                        "forward",
-                        "full"
-                      ],
-                      "description": "Minimum subject compatibility level enforced on the first decoded message. Requires `subject`."
-                    },
-                    "auth": {
-                      "type": "object",
-                      "description": "Optional registry authentication.",
-                      "properties": {
-                        "type": {
-                          "type": "string",
-                          "enum": [
-                            "basic",
-                            "bearer"
-                          ]
-                        },
-                        "username": {
-                          "type": "string"
-                        },
-                        "password": {
-                          "type": "string"
-                        },
-                        "token": {
-                          "type": "string"
-                        }
-                      },
-                      "required": [
-                        "type"
-                      ]
-                    }
-                  },
-                  "required": [
-                    "type",
-                    "registry_url"
-                  ]
-                }
-              ]
-            },
             "output_type": {
               "type": "object",
               "description": "Database connection settings, tagged by `type` (`mysql` or `postgres`), each with `uri` and optional `ssl`.",
@@ -7518,20 +7226,20 @@
         "type": {
           "type": "string",
           "enum": [
-            null,
-            null,
-            null,
-            null,
-            null,
-            null,
-            null,
-            null,
-            null,
-            null,
-            null,
-            null,
-            null,
-            null
+            "arrow_to_json",
+            "arrow_to_protobuf",
+            "batch",
+            "embedding",
+            "json_to_arrow",
+            "llm",
+            "lookup",
+            "milvus_search",
+            "pgvector_search",
+            "protobuf_to_arrow",
+            "python",
+            "sql",
+            "vector_search",
+            "vrl"
           ],
           "description": "processor component type."
         },
@@ -10545,10 +10253,10 @@
         "type": {
           "type": "string",
           "enum": [
-            null,
-            null,
-            null,
-            null
+            "memory",
+            "session_window",
+            "sliding_window",
+            "tumbling_window"
           ],
           "description": "buffer component type."
         },
@@ -11337,10 +11045,10 @@
         "type": {
           "type": "string",
           "enum": [
-            null,
-            null,
-            null,
-            null
+            "debezium_json",
+            "json",
+            "protobuf",
+            "schema_registry"
           ],
           "description": "codec component type."
         },
@@ -12108,7 +11816,7 @@
         "type": {
           "type": "string",
           "enum": [
-            null
+            "redis"
           ],
           "description": "temporary component type."
         },
